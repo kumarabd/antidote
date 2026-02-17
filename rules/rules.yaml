@@ -1,0 +1,50 @@
+# Antidote Rules Configuration
+# Phase 3: Enhanced rules with stronger patterns and benign labels
+
+known_domains:
+  - api.openai.com
+  - api.anthropic.com
+  - github.com
+  - githubusercontent.com
+  - pypi.org
+  - npmjs.org
+  - registry.npmjs.org
+  - pypi.python.org
+
+sensitive_path_globs:
+  - "**/.env"
+  - "**/.env.*"
+  - "**/*secrets*"
+  - "**/*.pem"
+  - "~/.ssh/**"
+  - "~/.aws/**"
+  - "**/id_rsa"
+  - "**/id_ed25519"
+  - "**/.aws/credentials"
+  - "**/secrets/**"
+  - "**/*token*"
+  - "**/*credential*"
+  - "**/*key*"
+
+benign_path_globs:
+  - "**/node_modules/**"
+  - "**/target/**"
+  - "**/.git/**"
+  - "**/vendor/**"
+  - "**/dist/**"
+  - "**/build/**"
+
+time_windows:
+  unknown_domains_window_seconds: 120
+  sensitive_burst_window_seconds: 60
+
+thresholds:
+  egress_mb_medium: 1.0
+  egress_mb_high: 10.0
+  bulk_delete: 20
+  bulk_write: 100
+  cmds_high: 30
+  unknown_domains_high: 3
+  unknown_domains_cluster: 3
+  sensitive_burst: 3
+  exfil_egress_mb: 5

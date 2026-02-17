@@ -1,0 +1,21 @@
+[package]
+name = "antidote-collectors"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+antidote-core = { path = "../core" }
+tokio = { workspace = true }
+sysinfo = { workspace = true }
+notify = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+regex = "1.10"

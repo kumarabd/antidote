@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/rules",
+    "crates/storage",
+    "crates/api",
+    "crates/collectors",
+    "crates/session",
+    "crates/daemon",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Antidote Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Core dependencies
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# HTTP server
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+
+# Config
+config = "0.14"
+serde_yaml = "0.9"
+
+# System info
+sysinfo = "0.31"
+
+# Pattern matching
+globset = "0.4"
+
+# File system watching
+notify = "6.1"
+
+# HTTP proxy
+hyper = "1.0"
+hyper-util = "0.1"
+http-body-util = "0.1"
+futures = "0.3"

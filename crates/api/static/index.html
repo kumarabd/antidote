@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Antidote - AI Activity Monitor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 1rem 2rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+        .header p {
+            font-size: 0.9rem;
+            opacity: 0.9;
+            margin-top: 0.25rem;
+        }
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            min-height: calc(100vh - 5rem);
+        }
+        .main-row {
+            display: flex;
+            gap: 2rem;
+            align-items: stretch;
+            flex: 1;
+            min-height: 0;
+        }
+        .main-left {
+            flex: 0 0 50%;
+            max-width: 50%;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+        .main-right {
+            flex: 1 1 50%;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        .session-list {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: auto;
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            min-height: 0;
+        }
+        .session-list .session-list-header {
+            flex-shrink: 0;
+        }
+        .session-list table {
+            flex: 1 1 auto;
+        }
+        .session-list-header {
+            padding: 1rem 1.5rem;
+            background: #f8f9fa;
+            border-bottom: 1px solid #dee2e6;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .session-list-header h2 {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+        .refresh-btn {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+        .refresh-btn:hover {
+            background: #0056b3;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 0.75rem 1.5rem;
+            text-align: left;
+            border-bottom: 1px solid #dee2e6;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            color: #6c757d;
+        }
+        tr.session-row {
+            cursor: pointer;
+        }
+        tr.session-row:hover {
+            background: #f8f9fa;
+        }
+        .risk-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .risk-low {
+            background: #d4edda;
+            color: #155724;
+        }
+        .risk-medium {
+            background: #fff3cd;
+            color: #856404;
+        }
+        .risk-high {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .label-chip {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            margin: 0.125rem;
+            background: #e9ecef;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            color: #495057;
+        }
+        .session-detail {
+            display: flex;
+            flex-direction: column;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 2rem;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .session-detail .detail-header {
+            flex-shrink: 0;
+        }
+        #detail-content {
+            flex: 1;
+            overflow: auto;
+            min-height: 0;
+        }
+        .session-detail.empty .detail-header,
+        .session-detail.empty #detail-content {
+            display: none;
+        }
+        .session-detail.empty::after {
+            content: 'Select a session to view details';
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #6c757d;
+            font-size: 1rem;
+            flex: 1;
+        }
+        .detail-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .detail-header h2 {
+            font-size: 1.5rem;
+        }
+        .focus-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .focus-btn:hover {
+            background: #218838;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 4px;
+        }
+        .stat-label {
+            font-size: 0.75rem;
+            color: #6c757d;
+            text-transform: uppercase;
+            margin-bottom: 0.5rem;
+        }
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+        .flags-list {
+            margin-top: 2rem;
+        }
+        .flag-item {
+            padding: 1rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid #dc3545;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .flag-severity {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+        .severity-crit {
+            background: #dc3545;
+            color: white;
+        }
+        .severity-high {
+            background: #fd7e14;
+            color: white;
+        }
+        .severity-med {
+            background: #ffc107;
+            color: #000;
+        }
+        .severity-low {
+            background: #6c757d;
+            color: white;
+        }
+        .close-btn {
+            background: #6c757d;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .close-btn:hover {
+            background: #5a6268;
+        }
+        .privacy-notice {
+            background: #e7f3ff;
+            border-left: 4px solid #007bff;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            border-radius: 4px;
+            flex-shrink: 0;
+        }
+        .privacy-notice strong {
+            color: #0056b3;
+        }
+        .error-msg {
+            color: #721c24;
+            background: #f8d7da;
+            padding: 1rem;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🛡️ Antidote - AI Activity Monitor</h1>
+        <p>Privacy-first monitoring: No file contents captured; only metadata; no HTTPS decryption</p>
+    </div>
+    <div class="container">
+        <div class="privacy-notice">
+            <strong>Privacy First:</strong> Antidote captures only metadata (file paths, domains, event counts). 
+            No file contents, no HTTPS decryption, no prompt capture.
+        </div>
+
+        <div class="main-row">
+            <div class="main-left">
+                <div class="session-list">
+                    <div class="session-list-header">
+                        <h2>Sessions</h2>
+                        <button class="refresh-btn" onclick="loadSessions()">Refresh</button>
+                    </div>
+                    <table id="sessions-table">
+                        <thead>
+                            <tr>
+                                <th>Start Time</th>
+                                <th>App</th>
+                                <th>Risk</th>
+                                <th>Score</th>
+                                <th>Labels</th>
+                                <th>Observed Roots</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sessions-tbody">
+                            <tr><td colspan="6">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="main-right">
+                <div class="session-detail empty" id="session-detail">
+                    <div class="detail-header">
+                        <h2>Session Details</h2>
+                        <div>
+                            <button class="focus-btn" onclick="setFocus()">Set Focus</button>
+                            <button class="close-btn" onclick="closeDetail()">Close</button>
+                        </div>
+                    </div>
+                    <div id="detail-content">
+                        <!-- Content loaded dynamically -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentSessionId = null;
+
+        function formatDate(ts) {
+            if (ts == null || ts === undefined) return '—';
+            const d = new Date(ts);
+            return isNaN(d.getTime()) ? String(ts) : d.toLocaleString();
+        }
+
+        function escapeHtml(str) {
+            if (str == null) return '';
+            const s = String(str);
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        async function loadSessions() {
+            try {
+                const response = await fetch('/sessions?limit=50');
+                const sessions = await response.json();
+                const tbody = document.getElementById('sessions-tbody');
+                tbody.innerHTML = '';
+                
+                if (sessions.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6">No sessions found</td></tr>';
+                    return;
+                }
+
+                sessions.forEach(session => {
+                    const sid = session.session_id || '';
+                    const labels = Array.isArray(session.labels) ? session.labels : [];
+                    const roots = Array.isArray(session.observed_roots) ? session.observed_roots : [];
+                    const riskBucket = (session.risk && session.risk.bucket) ? String(session.risk.bucket).toLowerCase() : 'low';
+                    const riskScore = (session.risk && session.risk.score != null) ? session.risk.score : 0;
+                    const labelsHtml = labels.length ? labels.map(l => `<span class="label-chip">${escapeHtml(String(l))}</span>`).join('') : '—';
+                    const rootsText = roots.length ? roots.join(', ') : '—';
+
+                    const row = document.createElement('tr');
+                    row.setAttribute('data-session-id', sid);
+                    row.classList.add('session-row');
+                    row.innerHTML = `
+                        <td>${formatDate(session.start_ts)}</td>
+                        <td>${escapeHtml(session.app || '')}</td>
+                        <td><span class="risk-badge risk-${riskBucket}">${escapeHtml(String(session.risk?.bucket || 'Low'))}</span></td>
+                        <td>${riskScore}</td>
+                        <td>${labelsHtml}</td>
+                        <td>${escapeHtml(rootsText)}</td>
+                    `;
+                    row.onclick = function () { showSessionDetail(sid); };
+                    tbody.appendChild(row);
+                });
+            } catch (error) {
+                console.error('Failed to load sessions:', error);
+                document.getElementById('sessions-tbody').innerHTML = '<tr><td colspan="6">Error loading sessions</td></tr>';
+            }
+        }
+
+        async function showSessionDetail(sessionId) {
+            currentSessionId = sessionId;
+            const detailContent = document.getElementById('detail-content');
+            try {
+                const [summaryRes, eventsRes, flagsRes] = await Promise.all([
+                    fetch(`/sessions/${sessionId}/summary`),
+                    fetch(`/sessions/${sessionId}/events?limit=20`),
+                    fetch(`/sessions/${sessionId}/flags`)
+                ]);
+
+                if (!summaryRes.ok) {
+                    const msg = summaryRes.status === 404 ? 'Session not found' : `Error ${summaryRes.status}`;
+                    detailContent.innerHTML = `<p class="error-msg">${msg}</p>`;
+                    document.getElementById('session-detail').classList.remove('empty');
+                    return;
+                }
+
+                const summary = await summaryRes.json();
+                const events = eventsRes.ok ? await eventsRes.json() : [];
+                const flags = flagsRes.ok ? await flagsRes.json() : [];
+
+                detailContent.innerHTML = `
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-label">Files Written</div>
+                            <div class="stat-value">${summary.counts.files_written || 0}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Files Deleted</div>
+                            <div class="stat-value">${summary.counts.files_deleted || 0}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Bytes Out</div>
+                            <div class="stat-value">${formatBytes(summary.counts.bytes_out || 0)}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Unknown Domains</div>
+                            <div class="stat-value">${summary.evidence.unknown_domains?.length || 0}</div>
+                        </div>
+                    </div>
+
+                    <h3>Flags (${flags.length})</h3>
+                    <div class="flags-list">
+                        ${flags.length === 0 ? '<p>No flags raised</p>' : flags.map(flag => `
+                            <div class="flag-item">
+                                <div>
+                                    <span class="flag-severity severity-${flag.severity.toLowerCase()}">${flag.severity}</span>
+                                    <strong>${flag.rule_id}</strong> - ${flag.message}
+                                </div>
+                                <div style="margin-top: 0.5rem; font-size: 0.875rem; color: #6c757d;">
+                                    ${formatDate(flag.ts)}
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+
+                    <h3 style="margin-top: 2rem;">Recent Events (${events.length})</h3>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Type</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${events.length === 0 ? '<tr><td colspan="3">No events</td></tr>' : events.map(event => `
+                                <tr>
+                                    <td>${formatDate(event.ts)}</td>
+                                    <td>${event.event_type}</td>
+                                    <td>${JSON.stringify(event.payload).substring(0, 100)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+
+                document.getElementById('session-detail').classList.remove('empty');
+            } catch (error) {
+                console.error('Failed to load session detail:', error);
+                alert('Failed to load session details');
+            }
+        }
+
+        async function setFocus() {
+            if (!currentSessionId) return;
+            try {
+                const response = await fetch('/debug/focus', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: currentSessionId })
+                });
+                if (response.ok) {
+                    alert('Session set as foreground');
+                } else {
+                    alert('Failed to set focus');
+                }
+            } catch (error) {
+                console.error('Failed to set focus:', error);
+                alert('Failed to set focus');
+            }
+        }
+
+        function closeDetail() {
+            document.getElementById('session-detail').classList.add('empty');
+            document.getElementById('detail-content').innerHTML = '';
+            currentSessionId = null;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+
+        // Load sessions on page load
+        loadSessions();
+        // Auto-refresh every 5 seconds
+        setInterval(loadSessions, 5000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "antidote-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+antidote-core = { path = "../core" }
+antidote-storage = { path = "../storage" }
+antidote-session = { path = "../session" }
+antidote-collectors = { path = "../collectors" }
+axum = { workspace = true }
+time = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
