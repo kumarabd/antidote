@@ -1,7 +1,7 @@
 //! Event pipeline worker
 
-use antidote_core::{Event, EventType};
-use antidote_rules::{RuleEngine, SessionState};
+use antidote_core::{Event, EventType, Flag, Label, Severity, EnforcementConfig, SafeModeConfig};
+use antidote_ruleengine::{RuleEngine, SessionState};
 use antidote_session::SessionManager;
 use antidote_storage::Storage;
 use std::collections::HashMap;
@@ -19,14 +19,45 @@ pub struct PipelineWorker {
     session_states: HashMap<String, SessionState>,
     /// Watched roots cache (for path matching)
     watched_roots: Arc<tokio::sync::RwLock<Vec<String>>>,
+    /// Phase 6: Enforcement config (for command blocking)
+    enforcement: Arc<tokio::sync::RwLock<EnforcementConfig>>,
+    /// Phase 6: Safe mode config (allowed_roots, domain allowlist in proxy)
+    safe_mode: Arc<tokio::sync::RwLock<SafeModeConfig>>,
 }
 
 impl PipelineWorker {
+    /// Phase 6: Send SIGTERM to process (never panics)
+    async fn kill_pid_sigterm(pid: i32) {
+        #[cfg(unix)]
+        {
+            use std::process::Stdio;
+            if let Ok(mut child) = tokio::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    child.wait(),
+                )
+                .await;
+            } else {
+                warn!("Failed to spawn kill for pid {}", pid);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+
     pub fn new(
         storage: Arc<Storage>,
         rule_engine: Arc<RuleEngine>,
         session_manager: Arc<SessionManager>,
         event_rx: mpsc::UnboundedReceiver<Event>,
+        enforcement: Arc<tokio::sync::RwLock<EnforcementConfig>>,
+        safe_mode: Arc<tokio::sync::RwLock<SafeModeConfig>>,
     ) -> Self {
         Self {
             storage,
@@ -35,6 +66,8 @@ impl PipelineWorker {
             event_rx,
             session_states: HashMap::new(),
             watched_roots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            enforcement,
+            safe_mode,
         }
     }
 
@@ -232,13 +265,14 @@ impl PipelineWorker {
                         session_id: active_id.clone(),
                         event_type: EventType::Tick,
                         payload: serde_json::json!({}),
+                        enforcement_action: false,
                     };
                     let flags = self.rule_engine.evaluate_event(&tick_event, state);
                     (flags, state.clone())
                 } else {
                     continue;
                 };
-                self.persist_flags(&active_id, &flags).await;
+                self.persist_flags(&active_id, &state_clone.app, &flags).await;
                 self.update_session_summary(&active_id, &state_clone).await;
             }
             return;
@@ -249,10 +283,45 @@ impl PipelineWorker {
             let session_state = self
                 .session_states
                 .entry(session_id.to_string())
-                .or_insert_with(|| SessionState::new(session_id.to_string(), app));
+                .or_insert_with(|| SessionState::new(session_id.to_string(), app.clone()));
             let flags = self.rule_engine.evaluate_event(&event, session_state);
             (flags, session_state.clone())
         };
+
+        let app = session_info
+            .as_ref()
+            .map(|s| s.app.clone())
+            .unwrap_or_else(|| "Background".to_string());
+
+        // Phase 6: Safe mode - reject file writes outside allowed_roots
+        if matches!(
+            event.event_type,
+            EventType::FileWrite | EventType::FileCreate | EventType::FileDelete
+        ) {
+            let safe = self.safe_mode.read().await;
+            if safe.enabled && !safe.allowed_roots.is_empty() {
+                if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
+                    let under_allowed = safe
+                        .allowed_roots
+                        .iter()
+                        .any(|root| path.starts_with(root.as_str()));
+                    if !under_allowed {
+                        drop(safe);
+                        let flag = Flag::new(
+                            session_id.to_string(),
+                            "SAFE_MODE_VIOLATION".to_string(),
+                            antidote_core::Severity::High,
+                            20,
+                            Label::SafeModeViolation,
+                            serde_json::json!({ "path": path }),
+                            format!("Safe mode: write outside allowed roots: {}", path),
+                        );
+                        self.persist_flags(session_id, &app, &[flag]).await;
+                        // Still persist event and continue (optionally kill - skip for now)
+                    }
+                }
+            }
+        }
 
         // Ensure session row exists before inserting events (FK: events.session_id -> sessions.session_id)
         self.update_session_summary(session_id, &state_clone).await;
@@ -262,9 +331,32 @@ impl PipelineWorker {
             error!("Failed to insert event: {}", e);
         }
 
-        // Persist flags if any
+        // Persist flags if any (and record risk history for high/crit for Phase 5 escalation)
         if !flags.is_empty() {
-            self.persist_flags(session_id, &flags).await;
+            self.persist_flags(session_id, &app, &flags).await;
+        }
+
+        // Phase 6: Dangerous command blocking (when enforcement enabled and audit provided PID)
+        if event.event_type == EventType::CmdExec
+            && flags.iter().any(|f| f.rule_id == "R3")
+        {
+            let enf = self.enforcement.read().await;
+            if enf.enabled && enf.block_dangerous_commands {
+                if let Some(pid) = event.payload.get("pid").and_then(|v| v.as_i64()).map(|p| p as i32) {
+                    drop(enf);
+                    Self::kill_pid_sigterm(pid).await;
+                    let block_flag = Flag::new(
+                        session_id.to_string(),
+                        "BLOCKED_COMMAND".to_string(),
+                        antidote_core::Severity::High,
+                        20,
+                        Label::EnforcementBlocked,
+                        event.payload.clone(),
+                        format!("Blocked dangerous command (pid {})", pid),
+                    );
+                    self.persist_flags(session_id, &app, &[block_flag]).await;
+                }
+            }
         }
 
         // Clean up ended sessions from in-memory state
@@ -278,10 +370,17 @@ impl PipelineWorker {
         }
     }
 
-    async fn persist_flags(&self, session_id: &str, flags: &[antidote_core::Flag]) {
+    async fn persist_flags(&self, session_id: &str, app: &str, flags: &[antidote_core::Flag]) {
         if !flags.is_empty() {
             if let Err(e) = self.storage.insert_flags(flags).await {
                 error!("Failed to insert flags for session {}: {}", session_id, e);
+            }
+            for flag in flags {
+                if matches!(flag.severity, Severity::High | Severity::Crit) {
+                    if let Err(e) = self.storage.record_risk_history(app, &flag.rule_id, flag.ts).await {
+                        error!("Failed to record risk history: {}", e);
+                    }
+                }
             }
         }
     }
@@ -304,6 +403,10 @@ impl PipelineWorker {
                 telemetry_confidence: antidote_core::TelemetryConfidence::default(),
                 dropped_events: 0,
                 participant_pids_count: 0,
+                drift_index: None,
+                baseline_comparison_summary: None,
+                enforcement_actions_count: 0,
+                forced_terminated: false,
             };
 
             if let Err(e) = self.storage.upsert_session_summary(&summary).await {
@@ -337,6 +440,10 @@ impl PipelineWorker {
             telemetry_confidence: session.telemetry_confidence,
             dropped_events: session.dropped_events,
             participant_pids_count: session.participant_pids_count,
+            drift_index: session.drift_index,
+            baseline_comparison_summary: session.baseline_comparison_summary.clone(),
+            enforcement_actions_count: session.enforcement_actions_count,
+            forced_terminated: session.forced_terminated,
         };
 
         if let Err(e) = self.storage.upsert_session_summary(&summary).await {

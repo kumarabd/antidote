@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Antidote - Security & Enforcement</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }
+        .header { background: #2c3e50; color: white; padding: 1rem 2rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header h1 { font-size: 1.5rem; }
+        .header a { color: rgba(255,255,255,0.9); text-decoration: none; margin-right: 1rem; }
+        .container { max-width: 800px; margin: 0 auto; padding: 2rem; }
+        .card { background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 1.5rem; margin-bottom: 1.5rem; }
+        .card h2 { font-size: 1.25rem; margin-bottom: 1rem; border-bottom: 1px solid #dee2e6; padding-bottom: 0.5rem; }
+        .warning { background: #fff3cd; border-left: 4px solid #ffc107; padding: 1rem; margin-bottom: 1.5rem; border-radius: 4px; }
+        .warning strong { color: #856404; }
+        .frozen-banner { background: #f8d7da; border-left: 4px solid #dc3545; padding: 1rem; margin-bottom: 1rem; border-radius: 4px; color: #721c24; }
+        .row { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0; }
+        .row:last-child { border-bottom: none; }
+        .switch { position: relative; width: 44px; height: 24px; background: #ccc; border-radius: 12px; cursor: pointer; }
+        .switch.on { background: #28a745; }
+        .switch::after { content: ''; position: absolute; width: 20px; height: 20px; background: white; border-radius: 50%; top: 2px; left: 2px; transition: left 0.2s; }
+        .switch.on::after { left: 22px; }
+        .freeze-btn { background: #dc3545; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 1rem; font-weight: 600; }
+        .freeze-btn:hover { background: #c82333; }
+        .freeze-btn:disabled { background: #6c757d; cursor: not-allowed; }
+        .unfreeze-btn { background: #28a745; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; margin-left: 0.5rem; }
+        .unfreeze-btn:hover { background: #218838; }
+        .status { font-size: 0.9rem; color: #6c757d; }
+        .error-msg { color: #721c24; background: #f8d7da; padding: 1rem; border-radius: 4px; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h1>Antidote - Security & Enforcement</h1>
+            <nav>
+                <a href="/ui/">Sessions</a>
+                <a href="/ui/insights">Insights</a>
+                <a href="/ui/security">Security</a>
+            </nav>
+        </div>
+    </div>
+    <div class="container">
+        <div class="warning">
+            <strong>Experimental:</strong> Enforcement (blocking, freeze, safe mode) is experimental. Use with caution. All actions are local and reversible.
+        </div>
+        <div id="frozen-banner" class="frozen-banner" style="display: none;">
+            AI activity is frozen. No new proxy connections; active sessions have been terminated. <button class="unfreeze-btn" onclick="unfreeze()">Unfreeze</button>
+        </div>
+        <div id="error" class="error-msg" style="display: none;"></div>
+
+        <div class="card">
+            <h2>Enforcement mode</h2>
+            <p class="status">When disabled, the system behaves as Phase 5 (monitoring only).</p>
+            <div class="row">
+                <span>Enforcement enabled</span>
+                <div id="switch-enabled" class="switch" onclick="toggle('enabled')"></div>
+            </div>
+            <div class="row">
+                <span>Block unknown domains (proxy)</span>
+                <div id="switch-block-unknown" class="switch" onclick="toggle('block_unknown_domains')"></div>
+            </div>
+            <div class="row">
+                <span>Block high egress</span>
+                <div id="switch-block-egress" class="switch" onclick="toggle('block_high_egress')"></div>
+            </div>
+            <div class="row">
+                <span>Block dangerous commands</span>
+                <div id="switch-block-cmds" class="switch" onclick="toggle('block_dangerous_commands')"></div>
+            </div>
+            <div class="row">
+                <span>Auto-freeze on high risk</span>
+                <div id="switch-auto-freeze" class="switch" onclick="toggle('auto_freeze_high_risk')"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Emergency</h2>
+            <p class="status">Immediately stop proxy and terminate all active AI sessions.</p>
+            <button id="freeze-btn" class="freeze-btn" onclick="freeze()">Freeze AI Activity</button>
+        </div>
+
+        <div class="card">
+            <h2>Safe mode</h2>
+            <p class="status">Restrict network to allowed domains and file activity to allowed roots. Configure via API (POST /enforcement and safe_mode config).</p>
+            <div class="row">
+                <span>Safe mode enabled</span>
+                <div id="switch-safe-mode" class="switch" onclick="toggleSafeMode()"></div>
+            </div>
+        </div>
+    </div>
+    <script>
+        let config = { enabled: false, block_unknown_domains: false, block_high_egress: false, block_dangerous_commands: false, auto_freeze_high_risk: false };
+        let frozen = false;
+        let safeModeEnabled = false;
+
+        function setError(msg) {
+            const el = document.getElementById('error');
+            el.textContent = msg || '';
+            el.style.display = msg ? 'block' : 'none';
+        }
+
+        function renderSwitches() {
+            document.getElementById('switch-enabled').classList.toggle('on', config.enabled);
+            document.getElementById('switch-block-unknown').classList.toggle('on', config.block_unknown_domains);
+            document.getElementById('switch-block-egress').classList.toggle('on', config.block_high_egress);
+            document.getElementById('switch-block-cmds').classList.toggle('on', config.block_dangerous_commands);
+            document.getElementById('switch-auto-freeze').classList.toggle('on', config.auto_freeze_high_risk);
+            document.getElementById('switch-safe-mode').classList.toggle('on', safeModeEnabled);
+            document.getElementById('frozen-banner').style.display = frozen ? 'block' : 'none';
+            document.getElementById('freeze-btn').disabled = frozen;
+        }
+
+        async function loadEnforcement() {
+            try {
+                const r = await fetch('/enforcement');
+                if (r.ok) {
+                    const data = await r.json();
+                    config = { enabled: data.enabled, block_unknown_domains: data.block_unknown_domains, block_high_egress: data.block_high_egress, block_dangerous_commands: data.block_dangerous_commands, auto_freeze_high_risk: data.auto_freeze_high_risk };
+                    frozen = !!data.frozen;
+                    safeModeEnabled = !!data.safe_mode?.enabled;
+                    renderSwitches();
+                }
+            } catch (e) {
+                setError('Failed to load enforcement config: ' + e.message);
+            }
+        }
+
+        async function toggle(field) {
+            const val = !config[field];
+            try {
+                const body = {};
+                body[field] = val;
+                const r = await fetch('/enforcement', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                if (r.ok) {
+                    config = await r.json();
+                    renderSwitches();
+                } else setError('Failed to update');
+            } catch (e) {
+                setError(e.message);
+            }
+        }
+
+        async function toggleSafeMode() {
+            safeModeEnabled = !safeModeEnabled;
+            try {
+                const r = await fetch('/enforcement', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ safe_mode_enabled: safeModeEnabled }) });
+                if (r.ok) loadEnforcement();
+                else renderSwitches();
+            } catch (e) {
+                setError(e.message);
+                renderSwitches();
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            loadEnforcement();
+            setInterval(loadEnforcement, 5000);
+        });
+
+        async function freeze() {
+            try {
+                const r = await fetch('/emergency/freeze', { method: 'POST' });
+                if (r.ok) {
+                    frozen = true;
+                    renderSwitches();
+                    setError('');
+                } else setError('Freeze failed');
+            } catch (e) {
+                setError(e.message);
+            }
+        }
+
+        async function unfreeze() {
+            try {
+                const r = await fetch('/emergency/unfreeze', { method: 'POST' });
+                if (r.ok) {
+                    frozen = false;
+                    renderSwitches();
+                    setError('');
+                } else setError('Unfreeze failed');
+            } catch (e) {
+                setError(e.message);
+            }
+        }
+
+    </script>
+</body>
+</html>

@@ -10,9 +10,10 @@ name = "antidote-daemon"
 path = "src/main.rs"
 
 [dependencies]
+antidote-behavior = { path = "../behavior" }
 antidote-core = { path = "../core" }
 antidote-storage = { path = "../storage" }
-antidote-rules = { path = "../rules" }
+antidote-ruleengine = { path = "../ruleengine" }
 antidote-api = { path = "../api" }
 antidote-collectors = { path = "../collectors" }
 antidote-session = { path = "../session" }

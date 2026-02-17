@@ -58,6 +58,13 @@ pub enum Label {
     // Phase 3: Benign labels (reduce false positives)
     BenignIndexing,
     LikelyDepInstall,
+    // Phase 5: Behavioral
+    BehavioralAnomaly,
+    RepeatedRisk,
+    // Phase 6: Enforcement
+    EnforcementBlocked,
+    SafeModeViolation,
+    EmergencyFreeze,
 }
 
 /// An event captured by the monitor
@@ -69,6 +76,9 @@ pub struct Event {
     pub session_id: String,
     pub event_type: EventType,
     pub payload: serde_json::Value,
+    /// Phase 6: True if this event represents an enforcement action (block, freeze, etc.)
+    #[serde(default)]
+    pub enforcement_action: bool,
 }
 
 impl Event {
@@ -84,6 +94,7 @@ impl Event {
             session_id,
             event_type,
             payload,
+            enforcement_action: false,
         }
     }
 }
@@ -242,6 +253,18 @@ pub struct SessionSummary {
     /// Count of unique PIDs that participated in this session (Phase 4)
     #[serde(default)]
     pub participant_pids_count: u32,
+    /// Phase 5: Drift index 0..100 (how much session deviates from app baseline)
+    #[serde(default)]
+    pub drift_index: Option<u8>,
+    /// Phase 5: Human-readable baseline comparison (e.g. "3.2x more egress than typical")
+    #[serde(default)]
+    pub baseline_comparison_summary: Option<String>,
+    /// Phase 6: Number of enforcement actions (blocks, kills) in this session
+    #[serde(default)]
+    pub enforcement_actions_count: u32,
+    /// Phase 6: True if session was force-terminated by emergency freeze
+    #[serde(default)]
+    pub forced_terminated: bool,
 }
 
 impl SessionSummary {
@@ -263,6 +286,10 @@ impl SessionSummary {
             telemetry_confidence: TelemetryConfidence::Low,
             dropped_events: 0,
             participant_pids_count: 0,
+            drift_index: None,
+            baseline_comparison_summary: None,
+            enforcement_actions_count: 0,
+            forced_terminated: false,
         }
     }
 }
@@ -307,5 +334,76 @@ pub mod payloads {
         pub path: Option<String>,
         pub remote_addr: Option<String>,
         pub remote_port: Option<u16>,
+    }
+}
+
+/// Phase 6: Enforcement configuration (opt-in, safe by default)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnforcementConfig {
+    pub enabled: bool,
+    pub block_unknown_domains: bool,
+    pub block_high_egress: bool,
+    pub block_dangerous_commands: bool,
+    pub auto_freeze_high_risk: bool,
+    /// Per-connection egress threshold in bytes (when block_high_egress is true)
+    #[serde(default = "default_egress_threshold")]
+    pub egress_threshold_bytes: u64,
+}
+
+fn default_egress_threshold() -> u64 {
+    50 * 1024 * 1024 // 50 MiB
+}
+
+impl Default for EnforcementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            block_unknown_domains: false,
+            block_high_egress: false,
+            block_dangerous_commands: false,
+            auto_freeze_high_risk: false,
+            egress_threshold_bytes: default_egress_threshold(),
+        }
+    }
+}
+
+/// Phase 6: Safe mode (restricted runtime)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeModeConfig {
+    pub enabled: bool,
+    pub allowed_domains: Vec<String>,
+    pub allowed_roots: Vec<String>,
+}
+
+impl Default for SafeModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: vec![
+                "api.openai.com".to_string(),
+                "api.anthropic.com".to_string(),
+            ],
+            allowed_roots: vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+mod enforcement_tests {
+    use super::{EnforcementConfig, SafeModeConfig};
+
+    #[test]
+    fn test_enforcement_disabled_by_default() {
+        let c = EnforcementConfig::default();
+        assert!(!c.enabled);
+        assert!(!c.block_unknown_domains);
+        assert!(!c.block_dangerous_commands);
+    }
+
+    #[test]
+    fn test_safe_mode_default() {
+        let s = SafeModeConfig::default();
+        assert!(!s.enabled);
+        assert!(s.allowed_domains.contains(&"api.openai.com".to_string()));
     }
 }

@@ -49,6 +49,14 @@ impl SessionState {
         self.summary.end_ts = Some(time::OffsetDateTime::now_utc());
     }
 
+    /// Phase 6: Mark session as force-terminated (emergency freeze)
+    pub fn force_terminate(&mut self) {
+        let now = time::OffsetDateTime::now_utc();
+        self.summary.end_ts = Some(now);
+        self.summary.last_event_ts = now;
+        self.summary.forced_terminated = true;
+    }
+
     pub fn is_active(&self) -> bool {
         self.summary.end_ts.is_none()
     }
@@ -298,6 +306,20 @@ impl SessionManager {
             .collect()
     }
 
+    /// Phase 6: Force-end sessions (e.g. emergency freeze). Marks each as ended and forced_terminated.
+    pub async fn force_end_sessions(&self, session_ids: &[String]) {
+        let mut sessions = self.sessions.write().await;
+        for id in session_ids {
+            if let Some(s) = sessions.get_mut(id) {
+                s.force_terminate();
+            }
+        }
+        let mut pid_map = self.pid_to_session.write().await;
+        for id in session_ids {
+            pid_map.retain(|_, sid| sid != id);
+        }
+    }
+
     /// Get all sessions (active and ended)
     pub async fn get_all_sessions(&self) -> Vec<SessionSummary> {
         let sessions = self.sessions.read().await;
@@ -345,5 +367,22 @@ impl SessionManager {
         } else {
             "Unknown".to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionManager;
+
+    #[tokio::test]
+    async fn test_force_end_sessions_empty() {
+        let m = SessionManager::new(vec!["Cursor".to_string()], 7);
+        m.force_end_sessions(&[]).await;
+    }
+
+    #[tokio::test]
+    async fn test_force_end_sessions_nonexistent() {
+        let m = SessionManager::new(vec!["Cursor".to_string()], 7);
+        m.force_end_sessions(&["nonexistent".to_string()]).await;
     }
 }

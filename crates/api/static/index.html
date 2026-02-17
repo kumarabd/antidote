@@ -141,6 +141,34 @@
             background: #f8d7da;
             color: #721c24;
         }
+        .drift-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .drift-normal {
+            background: #d4edda;
+            color: #155724;
+        }
+        .drift-elevated {
+            background: #fff3cd;
+            color: #856404;
+        }
+        .drift-significant {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .baseline-comparison {
+            background: #e7f3ff;
+            border-left: 4px solid #007bff;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 4px;
+            font-size: 0.95rem;
+        }
         .label-chip {
             display: inline-block;
             padding: 0.125rem 0.5rem;
@@ -291,8 +319,17 @@
 </head>
 <body>
     <div class="header">
-        <h1>🛡️ Antidote - AI Activity Monitor</h1>
-        <p>Privacy-first monitoring: No file contents captured; only metadata; no HTTPS decryption</p>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h1>🛡️ Antidote - AI Activity Monitor</h1>
+                <p>Privacy-first monitoring: No file contents captured; only metadata; no HTTPS decryption</p>
+            </div>
+            <nav style="display: flex; gap: 1rem;">
+                <a href="/ui/" style="color: rgba(255,255,255,0.9); text-decoration: none;">Sessions</a>
+                <a href="/ui/insights" style="color: rgba(255,255,255,0.9); text-decoration: none;">Insights</a>
+                <a href="/ui/security" style="color: rgba(255,255,255,0.9); text-decoration: none;">Security</a>
+            </nav>
+        </div>
     </div>
     <div class="container">
         <div class="privacy-notice">
@@ -419,7 +456,18 @@
                 const events = eventsRes.ok ? await eventsRes.json() : [];
                 const flags = flagsRes.ok ? await flagsRes.json() : [];
 
+                const driftIndex = summary.drift_index != null ? summary.drift_index : null;
+                const driftBucket = driftIndex == null ? null : (driftIndex <= 30 ? 'normal' : driftIndex <= 60 ? 'elevated' : 'significant');
+                const driftLabel = driftBucket ? (driftBucket === 'normal' ? 'Normal' : driftBucket === 'elevated' ? 'Elevated' : 'Significant') : null;
+                const baselineText = summary.baseline_comparison_summary || '';
+
                 detailContent.innerHTML = `
+                    ${driftIndex != null ? `
+                    <div style="margin-bottom: 1rem;">
+                        <span class="drift-badge drift-${driftBucket}">Drift: ${driftLabel} (${driftIndex})</span>
+                    </div>
+                    ` : ''}
+                    ${baselineText ? `<div class="baseline-comparison">${escapeHtml(baselineText)}</div>` : ''}
                     <div class="stats-grid">
                         <div class="stat-card">
                             <div class="stat-label">Files Written</div>
@@ -438,6 +486,15 @@
                             <div class="stat-value">${summary.evidence.unknown_domains?.length || 0}</div>
                         </div>
                     </div>
+
+                    ${(summary.enforcement_actions_count > 0 || summary.forced_terminated) ? `
+                    <h3>Enforcement</h3>
+                    <div class="stat-card" style="margin-bottom: 1rem;">
+                        <div class="stat-label">Enforcement actions</div>
+                        <div class="stat-value">${summary.enforcement_actions_count || 0}</div>
+                        ${summary.forced_terminated ? '<p style="margin-top: 0.5rem; color: #721c24;"><strong>Session was force-terminated (emergency freeze)</strong></p>' : ''}
+                    </div>
+                    ` : ''}
 
                     <h3>Flags (${flags.length})</h3>
                     <div class="flags-list">

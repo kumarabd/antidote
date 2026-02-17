@@ -1,7 +1,8 @@
 [workspace]
 members = [
+    "crates/behavior",
     "crates/core",
-    "crates/rules",
+    "crates/ruleengine",
     "crates/storage",
     "crates/api",
     "crates/collectors",

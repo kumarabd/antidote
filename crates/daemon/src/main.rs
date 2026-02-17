@@ -3,13 +3,19 @@
 mod pipeline;
 
 use antidote_api::create_router;
+use antidote_behavior;
 use antidote_collectors::{FsWatcherManager, ProcessPoller, ProxyServer};
-use antidote_core::{Event, EventType};
-use antidote_rules::RuleEngine;
+use antidote_core::{
+    Event, EventType, Flag, Label, SessionSummary, Severity,
+    EnforcementConfig, SafeModeConfig,
+};
+use antidote_ruleengine::RuleEngine;
 use antidote_session::SessionManager;
-use antidote_storage::Storage;
+use antidote_storage::{AppBaselineRow, Storage};
 use anyhow::{Context, Result};
 use pipeline::PipelineWorker;
+use std::collections::HashMap;
+use time::format_description::well_known::Rfc3339;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +42,10 @@ struct Config {
     fs: FsConfig,
     proxy: ProxyConfig,
     retention: RetentionConfig,
+    #[serde(default)]
+    enforcement: EnforcementConfig,
+    #[serde(default)]
+    safe_mode: SafeModeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,8 +79,66 @@ impl Default for Config {
                 listen_addr: "127.0.0.1:17846".to_string(),
             },
             retention: RetentionConfig { days: 7 },
+            enforcement: EnforcementConfig::default(),
+            safe_mode: SafeModeConfig::default(),
         }
     }
+}
+
+/// Phase 6: Run emergency freeze - kill active session processes and mark sessions forced_terminated
+async fn run_emergency_freeze(
+    storage: &Storage,
+    session_manager: &SessionManager,
+) {
+    let active = session_manager.get_active_sessions().await;
+    let now = time::OffsetDateTime::now_utc();
+    let session_ids: Vec<String> = active.iter().map(|s| s.session_id.clone()).collect();
+    let pids: Vec<i32> = active.iter().map(|s| s.root_pid).filter(|&p| p != 0).collect();
+
+    for pid in pids {
+        #[cfg(unix)]
+        {
+            use std::process::Stdio;
+            match tokio::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                }
+                Err(e) => {
+                    warn!("Failed to kill pid {}: {}", pid, e);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    }
+
+    session_manager.force_end_sessions(&session_ids).await;
+
+    for session_id in &session_ids {
+        if let Ok(Some(mut summary)) = storage.get_session(session_id).await {
+            summary.end_ts = Some(now);
+            summary.forced_terminated = true;
+            summary.enforcement_actions_count = summary.enforcement_actions_count.saturating_add(1);
+            let _ = storage.upsert_session_summary(&summary).await;
+        }
+        let flag = Flag::new(
+            session_id.clone(),
+            "EMERGENCY_FREEZE".to_string(),
+            Severity::High,
+            20,
+            Label::EmergencyFreeze,
+            serde_json::json!({ "forced_termination": true }),
+            "Session force-terminated by emergency freeze".to_string(),
+        );
+        let _ = storage.insert_flags(&[flag]).await;
+    }
+    info!("Emergency freeze completed: {} sessions force-terminated", session_ids.len());
 }
 
 #[tokio::main]
@@ -100,6 +168,33 @@ async fn main() -> Result<()> {
     );
     info!("Storage initialized");
 
+    // Phase 5: Load behavioral baselines into memory
+    let baseline_cache: Arc<RwLock<HashMap<String, antidote_behavior::AppBaseline>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    if let Ok(rows) = storage.get_all_baselines().await {
+        let time = time::OffsetDateTime::now_utc();
+        for row in rows {
+            let last_updated = time::OffsetDateTime::parse(&row.last_updated, &Rfc3339)
+                .unwrap_or(time);
+            let b = antidote_behavior::AppBaseline {
+                app: row.app.clone(),
+                session_count: row.session_count.max(0) as u64,
+                avg_files_written: row.avg_files_written,
+                avg_files_deleted: row.avg_files_deleted,
+                avg_bytes_out: row.avg_bytes_out,
+                avg_unknown_domains: row.avg_unknown_domains,
+                avg_cmds: row.avg_cmds,
+                var_files_written: row.var_files_written,
+                var_bytes_out: row.var_bytes_out,
+                var_unknown_domains: row.var_unknown_domains,
+                var_cmds: row.var_cmds,
+                last_updated,
+            };
+            baseline_cache.write().await.insert(row.app, b);
+        }
+        info!("Loaded {} app baselines", baseline_cache.read().await.len());
+    }
+
     // Load rule engine
     let rule_engine = Arc::new(
         RuleEngine::load_from_file(&config.rules_path)
@@ -116,6 +211,25 @@ async fn main() -> Result<()> {
 
     // Create event channel
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+
+    // Phase 6: Enforcement state (shared with API and proxy)
+    let enforcement_state: Arc<RwLock<EnforcementConfig>> =
+        Arc::new(RwLock::new(config.enforcement.clone()));
+    let safe_mode_state: Arc<RwLock<SafeModeConfig>> =
+        Arc::new(RwLock::new(config.safe_mode.clone()));
+    let frozen_state: Arc<RwLock<bool>> = Arc::new(RwLock::new(false));
+    let (freeze_tx, mut freeze_rx) = mpsc::unbounded_channel::<()>();
+    let (flag_tx, mut flag_rx) = mpsc::unbounded_channel::<Flag>();
+
+    // Ensure "enforcement" session exists for proxy-originated flags (FK)
+    {
+        let enforcement_session = SessionSummary::new(
+            "enforcement".to_string(),
+            "System".to_string(),
+            0,
+        );
+        let _ = storage.upsert_session_summary(&enforcement_session).await;
+    }
 
     // Initialize FS watcher manager
     let fs_watcher = Arc::new(RwLock::new(FsWatcherManager::new(event_tx.clone())));
@@ -143,12 +257,20 @@ async fn main() -> Result<()> {
     let api_addr = config.listen_addr.clone();
     let proxy_enabled = config.proxy.enabled;
     let proxy_listen_addr = config.proxy.listen_addr.clone();
+    let api_enforcement = enforcement_state.clone();
+    let api_safe_mode = safe_mode_state.clone();
+    let api_frozen = frozen_state.clone();
+    let api_freeze_tx = freeze_tx.clone();
     let api_handle = tokio::spawn(async move {
         let router = create_router(
             api_storage,
             Some(api_session_manager),
             proxy_enabled,
             proxy_listen_addr,
+            api_enforcement,
+            api_safe_mode,
+            api_frozen,
+            Some(api_freeze_tx),
         );
         let listener = TcpListener::bind(&api_addr)
             .await
@@ -191,6 +313,7 @@ async fn main() -> Result<()> {
                         session_id: "broadcast".to_string(),
                         event_type: EventType::Tick,
                         payload: serde_json::json!({}),
+                        enforcement_action: false,
                     };
                     if tick_tx.send(event).is_err() {
                         break;
@@ -207,16 +330,51 @@ async fn main() -> Result<()> {
         rule_engine.clone(),
         session_manager.clone(),
         event_rx,
+        enforcement_state.clone(),
+        safe_mode_state.clone(),
     );
     let pipeline_handle = tokio::spawn(async move {
         pipeline.run().await;
+    });
+
+    // Phase 6: Spawn task to consume proxy-originated flags and persist
+    let flag_storage = storage.clone();
+    let flag_handle = tokio::spawn(async move {
+        while let Some(flag) = flag_rx.recv().await {
+            if let Err(e) = flag_storage.insert_flags(&[flag]).await {
+                warn!("Failed to persist proxy flag: {}", e);
+            }
+        }
+    });
+
+    // Phase 6: Spawn freeze task (kill active sessions when freeze is triggered)
+    let freeze_storage = storage.clone();
+    let freeze_session_manager = session_manager.clone();
+    let mut shutdown_rx_freeze = shutdown_tx.subscribe();
+    let freeze_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = freeze_rx.recv() => {
+                    run_emergency_freeze(&freeze_storage, &freeze_session_manager).await;
+                }
+                _ = shutdown_rx_freeze.recv() => break,
+            }
+        }
     });
 
     // Start proxy server (if enabled; select with shutdown so it stops accepting)
     let proxy_handle = if config.proxy.enabled {
         let proxy_addr = config.proxy.listen_addr.parse()
             .context("Invalid proxy listen address")?;
-        let proxy = ProxyServer::new(proxy_addr, event_tx.clone());
+        let known_domains = rule_engine.known_domains().to_vec();
+        let proxy = ProxyServer::new(proxy_addr, event_tx.clone())
+            .with_enforcement(
+                known_domains,
+                enforcement_state.clone(),
+                safe_mode_state.clone(),
+                frozen_state.clone(),
+                Some(flag_tx.clone()),
+            );
         let mut shutdown_rx_proxy = shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
             tokio::select! {
@@ -232,9 +390,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Start idle timeout checker (listens for shutdown so it can exit)
+    // Start idle timeout checker + Phase 5 behavioral (baseline update, anomaly, escalation, drift)
     let idle_manager = session_manager.clone();
     let idle_storage = storage.clone();
+    let idle_baselines = baseline_cache.clone();
     let mut shutdown_rx_idle = shutdown_tx.subscribe();
     let idle_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -243,10 +402,93 @@ async fn main() -> Result<()> {
                 _ = interval.tick() => {
                     let ended = idle_manager.check_idle_timeout().await;
                     for session_id in ended {
-                        if let Some(summary) = idle_manager.get_session(&session_id).await {
-                            if let Err(e) = idle_storage.upsert_session_summary(&summary).await {
-                                warn!("Failed to persist ended session {}: {}", session_id, e);
+                        // Prefer summary from storage (has latest counts from pipeline)
+                        let mut summary_opt = idle_storage.get_session(&session_id).await.ok().flatten();
+                        if summary_opt.is_none() {
+                            summary_opt = idle_manager.get_session(&session_id).await;
+                        }
+                        let mut summary = match summary_opt {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let now = time::OffsetDateTime::now_utc();
+                        if summary.end_ts.is_none() {
+                            summary.end_ts = Some(now);
+                        }
+
+                        // Phase 5: Update baseline (EMA)
+                        let current = idle_baselines.read().await.get(&summary.app).cloned();
+                        let new_baseline = antidote_behavior::update_baseline_ema(
+                            current.as_ref(),
+                            &summary.app,
+                            &summary.counts,
+                            antidote_behavior::DEFAULT_EMA_ALPHA,
+                            now,
+                        );
+                        let row = AppBaselineRow {
+                            app: new_baseline.app.clone(),
+                            session_count: new_baseline.session_count as i64,
+                            avg_files_written: new_baseline.avg_files_written,
+                            avg_files_deleted: new_baseline.avg_files_deleted,
+                            avg_bytes_out: new_baseline.avg_bytes_out,
+                            avg_unknown_domains: new_baseline.avg_unknown_domains,
+                            avg_cmds: new_baseline.avg_cmds,
+                            var_files_written: new_baseline.var_files_written,
+                            var_bytes_out: new_baseline.var_bytes_out,
+                            var_unknown_domains: new_baseline.var_unknown_domains,
+                            var_cmds: new_baseline.var_cmds,
+                            last_updated: new_baseline.last_updated.format(&Rfc3339).unwrap_or_default().to_string(),
+                        };
+                        let _ = idle_storage.upsert_app_baseline(&row).await;
+                        idle_baselines.write().await.insert(summary.app.clone(), new_baseline.clone());
+
+                        // Anomaly detection (keep read guard alive for baseline_ref uses below)
+                        let baseline_guard = idle_baselines.read().await;
+                        let baseline_ref = baseline_guard.get(&summary.app);
+                        let anomaly_flags = antidote_behavior::detect_anomalies(
+                            &summary.session_id,
+                            &summary.app,
+                            &summary.counts,
+                            &summary.evidence,
+                            baseline_ref,
+                            &antidote_behavior::AnomalyConfig::default(),
+                        );
+                        // Escalation (risk history already recorded when flags were created)
+                        let risk_counts = idle_storage
+                            .get_risk_history_last_n_days(&summary.app, antidote_behavior::ESCALATION_DAYS)
+                            .await
+                            .unwrap_or_default();
+                        let escalation_flag = antidote_behavior::check_escalation(
+                            &summary.session_id,
+                            &summary.app,
+                            &risk_counts,
+                        );
+                        let mut all_new_flags = anomaly_flags;
+                        if let Some(f) = escalation_flag {
+                            all_new_flags.push(f);
+                        }
+                        for flag in &all_new_flags {
+                            let _ = idle_storage.insert_flags(&[flag.clone()]).await;
+                            if matches!(flag.severity, Severity::High | Severity::Crit) {
+                                let _ = idle_storage.record_risk_history(&summary.app, &flag.rule_id, flag.ts).await;
                             }
+                        }
+
+                        // Drift index (simplified: no historical sets here)
+                        let drift_index = antidote_behavior::compute_drift_index(
+                            &summary,
+                            baseline_ref,
+                            &std::collections::HashSet::new(),
+                            &std::collections::HashSet::new(),
+                            0.0,
+                        );
+                        let baseline_comp =
+                            antidote_behavior::build_baseline_comparison_summary(&summary, baseline_ref);
+                        summary.drift_index = Some(drift_index);
+                        summary.baseline_comparison_summary = baseline_comp;
+
+                        if let Err(e) = idle_storage.upsert_session_summary(&summary).await {
+                            warn!("Failed to persist ended session {}: {}", session_id, e);
                         }
                     }
                 }
@@ -271,6 +513,9 @@ async fn main() -> Result<()> {
                     if let Err(e) = retention_storage.prune_flags_older_than(cutoff).await {
                         warn!("Failed to prune flags: {}", e);
                     }
+                    if let Err(e) = retention_storage.prune_risk_history_older_than(cutoff).await {
+                        warn!("Failed to prune risk history: {}", e);
+                    }
                     info!("Retention pruning completed (cutoff: {})", cutoff);
                 }
                 _ = shutdown_rx_retention.recv() => break,
@@ -291,6 +536,8 @@ async fn main() -> Result<()> {
 
     // Close event channel so pipeline, poller, tick, proxy exit
     drop(event_tx);
+    drop(freeze_tx);
+    drop(flag_tx);
 
     // Wait for tasks to complete
     let mut handles: Vec<TaskHandle> = vec![
@@ -300,6 +547,8 @@ async fn main() -> Result<()> {
         TaskHandle::Unit(pipeline_handle),
         TaskHandle::Unit(idle_handle),
         TaskHandle::Unit(retention_handle),
+        TaskHandle::Unit(flag_handle),
+        TaskHandle::Unit(freeze_handle),
     ];
     if let Some(proxy_h) = proxy_handle {
         handles.push(TaskHandle::Unit(proxy_h));

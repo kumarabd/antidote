@@ -86,6 +86,7 @@ impl FsWatcherManager {
                             session_id: "pending".to_string(),
                             event_type,
                             payload,
+                            enforcement_action: false,
                         };
 
                         if event_tx.send(event).is_err() {

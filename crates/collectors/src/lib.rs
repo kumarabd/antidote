@@ -98,6 +98,7 @@ impl ProcessPoller {
                             session_id: "pending".to_string(),
                             event_type: EventType::ProcStart,
                             payload,
+                            enforcement_action: false,
                         };
 
                         if self.event_tx.send(event).is_err() {
@@ -140,6 +141,7 @@ impl ProcessPoller {
                         session_id: "pending".to_string(),
                         event_type: EventType::ProcExit,
                         payload,
+                        enforcement_action: false,
                     };
 
                     if self.event_tx.send(event).is_err() {

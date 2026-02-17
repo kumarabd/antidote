@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Antidote - Insights</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 1rem 2rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .header h1 { font-size: 1.5rem; font-weight: 600; }
+        .header p { font-size: 0.9rem; opacity: 0.9; margin-top: 0.25rem; }
+        .header a { color: rgba(255,255,255,0.9); text-decoration: none; margin-right: 1rem; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .card h2 { font-size: 1.25rem; margin-bottom: 1rem; border-bottom: 1px solid #dee2e6; padding-bottom: 0.5rem; }
+        .bar-chart { display: flex; flex-direction: column; gap: 0.5rem; }
+        .bar-row { display: flex; align-items: center; gap: 0.75rem; }
+        .bar-label { min-width: 120px; font-size: 0.875rem; }
+        .bar-track { flex: 1; height: 24px; background: #e9ecef; border-radius: 4px; overflow: hidden; }
+        .bar-fill { height: 100%; background: #007bff; border-radius: 4px; min-width: 2px; }
+        .bar-value { font-size: 0.875rem; color: #6c757d; min-width: 60px; text-align: right; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #dee2e6; }
+        th { background: #f8f9fa; font-weight: 600; font-size: 0.875rem; }
+        .drift-normal { background: #d4edda; color: #155724; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }
+        .drift-elevated { background: #fff3cd; color: #856404; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }
+        .drift-significant { background: #f8d7da; color: #721c24; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }
+        .empty-msg { color: #6c757d; font-style: italic; padding: 1rem; }
+        .error-msg { color: #721c24; background: #f8d7da; padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h1>Antidote - Insights</h1>
+                <p>Behavioral baselines, risk trends, drift</p>
+            </div>
+            <nav>
+                <a href="/ui/">Sessions</a>
+                <a href="/ui/insights">Insights</a>
+            </nav>
+        </div>
+    </div>
+    <div class="container">
+        <div id="error" class="error-msg" style="display: none;"></div>
+        <div id="content">
+            <div class="card">
+                <h2>Risk trend (last 7 days)</h2>
+                <div id="risk-trend" class="bar-chart"></div>
+            </div>
+            <div class="card">
+                <h2>Top repeated risk patterns</h2>
+                <div id="repeated-risk"></div>
+            </div>
+            <div class="card">
+                <h2>Sessions with drift</h2>
+                <div id="sessions-drift"></div>
+            </div>
+            <div class="card">
+                <h2>Per-app baselines</h2>
+                <div id="baselines"></div>
+            </div>
+        </div>
+    </div>
+    <script>
+        function escapeHtml(str) {
+            if (str == null) return '';
+            const s = String(str);
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+        function driftClass(idx) {
+            if (idx == null) return '';
+            if (idx <= 30) return 'drift-normal';
+            if (idx <= 60) return 'drift-elevated';
+            return 'drift-significant';
+        }
+        function driftLabel(idx) {
+            if (idx == null) return '—';
+            if (idx <= 30) return 'Normal';
+            if (idx <= 60) return 'Elevated';
+            return 'Significant';
+        }
+        async function loadInsights() {
+            const errEl = document.getElementById('error');
+            try {
+                const res = await fetch('/insights');
+                if (!res.ok) throw new Error('Failed to load insights: ' + res.status);
+                const data = await res.json();
+
+                const trend = data.risk_trend_7d || [];
+                const maxSessions = Math.max(1, ...trend.map(t => t.session_count));
+                const maxScore = Math.max(1, ...trend.map(t => t.avg_risk_score));
+                document.getElementById('risk-trend').innerHTML = trend.length === 0
+                    ? '<p class="empty-msg">No session data in last 7 days</p>'
+                    : trend.map(t => `
+                        <div class="bar-row">
+                            <span class="bar-label">${escapeHtml(t.date)}</span>
+                            <div class="bar-track"><div class="bar-fill" style="width: ${(t.session_count / maxSessions) * 100}%"></div></div>
+                            <span class="bar-value">${t.session_count} sessions, avg score ${Number(t.avg_risk_score).toFixed(1)}</span>
+                        </div>
+                    `).join('');
+
+                const repeated = data.top_repeated_risk || [];
+                document.getElementById('repeated-risk').innerHTML = repeated.length === 0
+                    ? '<p class="empty-msg">No repeated risk patterns</p>'
+                    : `<table><thead><tr><th>App</th><th>Rule</th><th>Count</th></tr></thead><tbody>${
+                        repeated.map(r => `<tr><td>${escapeHtml(r.app)}</td><td>${escapeHtml(r.rule_id)}</td><td>${r.count}</td></tr>`).join('')
+                    }</tbody></table>`;
+
+                const sessions = data.sessions_with_drift || [];
+                document.getElementById('sessions-drift').innerHTML = sessions.length === 0
+                    ? '<p class="empty-msg">No sessions with drift index</p>'
+                    : `<table><thead><tr><th>Session</th><th>App</th><th>Drift</th><th>Risk score</th></tr></thead><tbody>${
+                        sessions.map(s => `<tr>
+                            <td><a href="/ui/">${escapeHtml(s.session_id)}</a></td>
+                            <td>${escapeHtml(s.app)}</td>
+                            <td><span class="${driftClass(s.drift_index)}">${driftLabel(s.drift_index)} (${s.drift_index != null ? s.drift_index : '—'})</span></td>
+                            <td>${s.risk_score}</td>
+                        </tr>`).join('')
+                    }</tbody></table>`;
+
+                const baselines = data.baselines || [];
+                document.getElementById('baselines').innerHTML = baselines.length === 0
+                    ? '<p class="empty-msg">No baseline data yet</p>'
+                    : `<table><thead><tr><th>App</th><th>Sessions</th><th>Avg files written</th><th>Avg bytes out</th><th>Avg unknown domains</th><th>Last updated</th></tr></thead><tbody>${
+                        baselines.map(b => `<tr>
+                            <td>${escapeHtml(b.app)}</td>
+                            <td>${b.session_count}</td>
+                            <td>${Number(b.avg_files_written).toFixed(1)}</td>
+                            <td>${Number(b.avg_bytes_out).toFixed(0)}</td>
+                            <td>${Number(b.avg_unknown_domains).toFixed(1)}</td>
+                            <td>${escapeHtml(b.last_updated || '—')}</td>
+                        </tr>`).join('')
+                    }</tbody></table>`;
+
+                errEl.style.display = 'none';
+            } catch (e) {
+                errEl.textContent = e.message || String(e);
+                errEl.style.display = 'block';
+            }
+        }
+        loadInsights();
+    </script>
+</body>
+</html>

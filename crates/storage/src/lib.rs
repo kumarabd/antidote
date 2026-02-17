@@ -62,6 +62,8 @@ impl Storage {
             include_str!("../migrations/0003_roots_and_retention.sql"),
             include_str!("../migrations/0004_observed_roots.sql"),
             include_str!("../migrations/0005_audit_fields.sql"),
+            include_str!("../migrations/0006_behavioral.sql"),
+            include_str!("../migrations/0007_enforcement.sql"),
         ];
 
         for (i, migration_sql) in migrations.iter().enumerate() {
@@ -117,13 +119,19 @@ impl Storage {
             antidote_core::TelemetryConfidence::High => "HIGH",
         };
 
+        let drift_index_i: Option<i64> = summary.drift_index.map(|u| u as i64);
+        let baseline_comp: Option<&str> = summary.baseline_comparison_summary.as_deref();
+        let enforcement_actions: i64 = summary.enforcement_actions_count as i64;
+        let forced_term: i64 = if summary.forced_terminated { 1 } else { 0 };
+
         sqlx::query(
             r#"
             INSERT INTO sessions (
                 session_id, app, root_pid, start_ts, end_ts, last_event_ts,
                 risk_score, risk_bucket, labels_json, counts_json, evidence_json, observed_roots_json,
-                telemetry_confidence, dropped_events, participant_pids_count, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                telemetry_confidence, dropped_events, participant_pids_count, drift_index, baseline_comparison_summary,
+                enforcement_actions_count, forced_terminated, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 app = excluded.app,
                 end_ts = excluded.end_ts,
@@ -137,6 +145,10 @@ impl Storage {
                 telemetry_confidence = excluded.telemetry_confidence,
                 dropped_events = excluded.dropped_events,
                 participant_pids_count = excluded.participant_pids_count,
+                drift_index = excluded.drift_index,
+                baseline_comparison_summary = excluded.baseline_comparison_summary,
+                enforcement_actions_count = excluded.enforcement_actions_count,
+                forced_terminated = excluded.forced_terminated,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -172,6 +184,10 @@ impl Storage {
         .bind(telemetry_confidence)
         .bind(summary.dropped_events as i64)
         .bind(summary.participant_pids_count as i64)
+        .bind(drift_index_i)
+        .bind(baseline_comp)
+        .bind(enforcement_actions)
+        .bind(forced_term)
         .bind(
             OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -208,10 +224,11 @@ impl Storage {
         let pid: Option<i32> = event.payload.get("pid").and_then(|v| v.as_i64()).map(|v| v as i32);
         let ppid: Option<i32> = event.payload.get("ppid").and_then(|v| v.as_i64()).map(|v| v as i32);
 
+        let enforcement_action = if event.enforcement_action { 1i32 } else { 0i32 };
         sqlx::query(
             r#"
-            INSERT INTO events (id, session_id, ts, event_type, payload_json, pid, ppid)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (id, session_id, ts, event_type, payload_json, pid, ppid, enforcement_action)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(event.id.to_string())
@@ -221,6 +238,7 @@ impl Storage {
         .bind(&payload_json)
         .bind(pid)
         .bind(ppid)
+        .bind(enforcement_action)
         .execute(&self.pool)
         .await
         .context("Failed to insert event")?;
@@ -250,6 +268,11 @@ impl Storage {
                 Label::PrivilegeEscalation => "PRIVILEGE_ESCALATION",
                 Label::BenignIndexing => "BENIGN_INDEXING",
                 Label::LikelyDepInstall => "LIKELY_DEP_INSTALL",
+                Label::BehavioralAnomaly => "BEHAVIORAL_ANOMALY",
+                Label::RepeatedRisk => "REPEATED_RISK",
+                Label::EnforcementBlocked => "ENFORCEMENT_BLOCKED",
+                Label::SafeModeViolation => "SAFE_MODE_VIOLATION",
+                Label::EmergencyFreeze => "EMERGENCY_FREEZE",
             };
 
             sqlx::query(
@@ -298,7 +321,8 @@ impl Storage {
             SELECT
                 session_id, app, root_pid, start_ts, end_ts, last_event_ts,
                 risk_score, risk_bucket, labels_json, counts_json, evidence_json, observed_roots_json,
-                telemetry_confidence, dropped_events, participant_pids_count
+                telemetry_confidence, dropped_events, participant_pids_count,
+                drift_index, baseline_comparison_summary, enforcement_actions_count, forced_terminated
             FROM sessions
             WHERE 1=1
         "#.to_string();
@@ -356,6 +380,11 @@ impl Storage {
                     "PRIVILEGE_ESCALATION" => Some(Label::PrivilegeEscalation),
                     "BENIGN_INDEXING" => Some(Label::BenignIndexing),
                     "LIKELY_DEP_INSTALL" => Some(Label::LikelyDepInstall),
+                    "BEHAVIORAL_ANOMALY" => Some(Label::BehavioralAnomaly),
+                    "REPEATED_RISK" => Some(Label::RepeatedRisk),
+                    "ENFORCEMENT_BLOCKED" => Some(Label::EnforcementBlocked),
+                    "SAFE_MODE_VIOLATION" => Some(Label::SafeModeViolation),
+                    "EMERGENCY_FREEZE" => Some(Label::EmergencyFreeze),
                     _ => None,
                 })
                 .collect();
@@ -373,6 +402,10 @@ impl Storage {
             };
             let dropped_events: i64 = row.get("dropped_events");
             let participant_pids_count: i64 = row.get("participant_pids_count");
+            let drift_index: Option<i64> = row.try_get("drift_index").ok();
+            let baseline_comparison_summary: Option<String> = row.try_get("baseline_comparison_summary").ok();
+            let enforcement_actions_count: i64 = row.try_get("enforcement_actions_count").unwrap_or(0);
+            let forced_terminated: i64 = row.try_get("forced_terminated").unwrap_or(0);
 
             let risk_bucket = match risk_bucket.as_str() {
                 "low" => RiskBucket::Low,
@@ -405,6 +438,10 @@ impl Storage {
                 telemetry_confidence,
                 dropped_events: dropped_events as u64,
                 participant_pids_count: participant_pids_count as u32,
+                drift_index: drift_index.map(|i| i.clamp(0, 255) as u8),
+                baseline_comparison_summary,
+                enforcement_actions_count: enforcement_actions_count.max(0) as u32,
+                forced_terminated: forced_terminated != 0,
             });
         }
 
@@ -418,7 +455,8 @@ impl Storage {
             SELECT
                 session_id, app, root_pid, start_ts, end_ts, last_event_ts,
                 risk_score, risk_bucket, labels_json, counts_json, evidence_json, observed_roots_json,
-                telemetry_confidence, dropped_events, participant_pids_count
+                telemetry_confidence, dropped_events, participant_pids_count,
+                drift_index, baseline_comparison_summary, enforcement_actions_count, forced_terminated
             FROM sessions
             WHERE session_id = ?
             "#,
@@ -457,6 +495,11 @@ impl Storage {
                     "PRIVILEGE_ESCALATION" => Some(Label::PrivilegeEscalation),
                     "BENIGN_INDEXING" => Some(Label::BenignIndexing),
                     "LIKELY_DEP_INSTALL" => Some(Label::LikelyDepInstall),
+                    "BEHAVIORAL_ANOMALY" => Some(Label::BehavioralAnomaly),
+                    "REPEATED_RISK" => Some(Label::RepeatedRisk),
+                    "ENFORCEMENT_BLOCKED" => Some(Label::EnforcementBlocked),
+                    "SAFE_MODE_VIOLATION" => Some(Label::SafeModeViolation),
+                    "EMERGENCY_FREEZE" => Some(Label::EmergencyFreeze),
                     _ => None,
                 })
                 .collect();
@@ -474,6 +517,10 @@ impl Storage {
             };
             let dropped_events: i64 = row.get("dropped_events");
             let participant_pids_count: i64 = row.get("participant_pids_count");
+            let drift_index: Option<i64> = row.try_get("drift_index").ok();
+            let baseline_comparison_summary: Option<String> = row.try_get("baseline_comparison_summary").ok();
+            let enforcement_actions_count: i64 = row.try_get("enforcement_actions_count").unwrap_or(0);
+            let forced_terminated: i64 = row.try_get("forced_terminated").unwrap_or(0);
 
             let risk_bucket = match risk_bucket.as_str() {
                 "low" => RiskBucket::Low,
@@ -506,6 +553,10 @@ impl Storage {
                 telemetry_confidence,
                 dropped_events: dropped_events as u64,
                 participant_pids_count: participant_pids_count as u32,
+                drift_index: drift_index.map(|i| i.clamp(0, 255) as u8),
+                baseline_comparison_summary,
+                enforcement_actions_count: enforcement_actions_count.max(0) as u32,
+                forced_terminated: forced_terminated != 0,
             }))
         } else {
             Ok(None)
@@ -524,7 +575,7 @@ impl Storage {
 
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, ts, event_type, payload_json
+            SELECT id, session_id, ts, event_type, payload_json, enforcement_action
             FROM events
             WHERE session_id = ?
             ORDER BY ts DESC
@@ -545,6 +596,7 @@ impl Storage {
             let ts_str: String = row.get("ts");
             let event_type_str: String = row.get("event_type");
             let payload_json: String = row.get("payload_json");
+            let enforcement_action: i64 = row.try_get("enforcement_action").unwrap_or(0);
 
             let id = Uuid::parse_str(&id_str).context("Invalid event ID")?;
             let ts = OffsetDateTime::parse(
@@ -569,6 +621,7 @@ impl Storage {
                 session_id: session_id_str,
                 event_type,
                 payload,
+                enforcement_action: enforcement_action != 0,
             });
         }
 
@@ -634,6 +687,13 @@ impl Storage {
                 "CONFIG_TAMPERING" => Label::ConfigTampering,
                 "BULK_TRAVERSAL" => Label::BulkTraversal,
                 "PRIVILEGE_ESCALATION" => Label::PrivilegeEscalation,
+                "BENIGN_INDEXING" => Label::BenignIndexing,
+                "LIKELY_DEP_INSTALL" => Label::LikelyDepInstall,
+                "BEHAVIORAL_ANOMALY" => Label::BehavioralAnomaly,
+                "REPEATED_RISK" => Label::RepeatedRisk,
+                "ENFORCEMENT_BLOCKED" => Label::EnforcementBlocked,
+                "SAFE_MODE_VIOLATION" => Label::SafeModeViolation,
+                "EMERGENCY_FREEZE" => Label::EmergencyFreeze,
                 _ => Label::ExecutionRisk,
             };
             let evidence: serde_json::Value = serde_json::from_str(&evidence_json)?;
@@ -751,6 +811,158 @@ impl Storage {
         Ok(())
     }
 
+    /// Phase 5: App baselines (behavioral)
+    pub async fn get_app_baseline(&self, app: &str) -> Result<Option<AppBaselineRow>> {
+        let row = sqlx::query_as::<_, AppBaselineRow>(
+            "SELECT app, session_count, avg_files_written, avg_files_deleted, avg_bytes_out, avg_unknown_domains, avg_cmds, var_files_written, var_bytes_out, var_unknown_domains, var_cmds, last_updated FROM app_baselines WHERE app = ?",
+        )
+        .bind(app)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to get app baseline")?;
+        Ok(row)
+    }
+
+    pub async fn upsert_app_baseline(&self, row: &AppBaselineRow) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO app_baselines (app, session_count, avg_files_written, avg_files_deleted, avg_bytes_out, avg_unknown_domains, avg_cmds, var_files_written, var_bytes_out, var_unknown_domains, var_cmds, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(app) DO UPDATE SET
+                session_count = excluded.session_count,
+                avg_files_written = excluded.avg_files_written,
+                avg_files_deleted = excluded.avg_files_deleted,
+                avg_bytes_out = excluded.avg_bytes_out,
+                avg_unknown_domains = excluded.avg_unknown_domains,
+                avg_cmds = excluded.avg_cmds,
+                var_files_written = excluded.var_files_written,
+                var_bytes_out = excluded.var_bytes_out,
+                var_unknown_domains = excluded.var_unknown_domains,
+                var_cmds = excluded.var_cmds,
+                last_updated = excluded.last_updated
+            "#,
+        )
+        .bind(&row.app)
+        .bind(row.session_count as i64)
+        .bind(row.avg_files_written)
+        .bind(row.avg_files_deleted)
+        .bind(row.avg_bytes_out)
+        .bind(row.avg_unknown_domains)
+        .bind(row.avg_cmds)
+        .bind(row.var_files_written)
+        .bind(row.var_bytes_out)
+        .bind(row.var_unknown_domains)
+        .bind(row.var_cmds)
+        .bind(&row.last_updated)
+        .execute(&self.pool)
+        .await
+        .context("Failed to upsert app baseline")?;
+        Ok(())
+    }
+
+    pub async fn get_all_baselines(&self) -> Result<Vec<AppBaselineRow>> {
+        let rows = sqlx::query_as::<_, AppBaselineRow>(
+            "SELECT app, session_count, avg_files_written, avg_files_deleted, avg_bytes_out, avg_unknown_domains, avg_cmds, var_files_written, var_bytes_out, var_unknown_domains, var_cmds, last_updated FROM app_baselines",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list baselines")?;
+        Ok(rows)
+    }
+
+    /// Phase 5: Risk history (cross-session escalation)
+    pub async fn record_risk_history(&self, app: &str, rule_id: &str, ts: OffsetDateTime) -> Result<()> {
+        let ts_str = ts
+            .format(&Rfc3339)
+            .map_err(|e| anyhow::anyhow!("format ts: {}", e))?
+            .to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO risk_history (app, rule_id, first_seen, last_seen, count)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(app, rule_id) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                count = count + 1
+            "#,
+        )
+        .bind(app)
+        .bind(rule_id)
+        .bind(&ts_str)
+        .bind(&ts_str)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record risk history")?;
+        Ok(())
+    }
+
+    /// Returns (rule_id, count) for app in last n days. Used for escalation.
+    pub async fn get_risk_history_last_n_days(
+        &self,
+        app: &str,
+        days: i64,
+    ) -> Result<Vec<(String, u32)>> {
+        let cutoff = OffsetDateTime::now_utc() - time::Duration::days(days);
+        let cutoff_str = cutoff
+            .format(&Rfc3339)
+            .map_err(|e| anyhow::anyhow!("format cutoff: {}", e))?
+            .to_string();
+        let rows = sqlx::query(
+            "SELECT rule_id, count FROM risk_history WHERE app = ? AND last_seen >= ?",
+        )
+        .bind(app)
+        .bind(&cutoff_str)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to get risk history")?;
+        let out: Vec<(String, u32)> = rows
+            .into_iter()
+            .map(|r| {
+                let rule_id: String = r.get("rule_id");
+                let count: i64 = r.get("count");
+                (rule_id, count.max(0) as u32)
+            })
+            .collect();
+        Ok(out)
+    }
+
+    pub async fn prune_risk_history_older_than(&self, cutoff_ts: OffsetDateTime) -> Result<u64> {
+        let cutoff_str = cutoff_ts
+            .format(&Rfc3339)
+            .map_err(|e| anyhow::anyhow!("format cutoff: {}", e))?
+            .to_string();
+        let result = sqlx::query("DELETE FROM risk_history WHERE last_seen < ?")
+            .bind(&cutoff_str)
+            .execute(&self.pool)
+            .await
+            .context("Failed to prune risk history")?;
+        Ok(result.rows_affected())
+    }
+
+    /// All risk history entries with last_seen >= cutoff (for insights).
+    pub async fn get_risk_history_since(
+        &self,
+        cutoff_ts: OffsetDateTime,
+    ) -> Result<Vec<(String, String, u32)>> {
+        let cutoff_str = cutoff_ts
+            .format(&Rfc3339)
+            .map_err(|e| anyhow::anyhow!("format cutoff: {}", e))?
+            .to_string();
+        let rows = sqlx::query("SELECT app, rule_id, count FROM risk_history WHERE last_seen >= ?")
+            .bind(&cutoff_str)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to get risk history")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let app: String = r.get("app");
+                let rule_id: String = r.get("rule_id");
+                let count: i64 = r.get("count");
+                (app, rule_id, count.max(0) as u32)
+            })
+            .collect())
+    }
+
     /// Retention/pruning functions
     pub async fn prune_events_older_than(&self, cutoff_ts: OffsetDateTime) -> Result<u64> {
         let cutoff_str = cutoff_ts.to_string();
@@ -774,6 +986,23 @@ impl Storage {
             .context("Failed to prune flags")?;
         Ok(result.rows_affected())
     }
+}
+
+/// Phase 5: App baseline row (DB representation)
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct AppBaselineRow {
+    pub app: String,
+    pub session_count: i64,
+    pub avg_files_written: f64,
+    pub avg_files_deleted: f64,
+    pub avg_bytes_out: f64,
+    pub avg_unknown_domains: f64,
+    pub avg_cmds: f64,
+    pub var_files_written: f64,
+    pub var_bytes_out: f64,
+    pub var_unknown_domains: f64,
+    pub var_cmds: f64,
+    pub last_updated: String,
 }
 
 /// Watched root representation
