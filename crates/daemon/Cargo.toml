@@ -18,6 +18,8 @@ antidote-api = { path = "../api" }
 antidote-collectors = { path = "../collectors" }
 antidote-session = { path = "../session" }
 futures = { workspace = true }
+signal-hook = { workspace = true }
+signal-hook-tokio = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

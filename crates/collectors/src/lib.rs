@@ -3,10 +3,14 @@
 mod fs_watcher;
 mod proxy;
 #[cfg(target_os = "macos")]
+mod app_detector_macos;
+#[cfg(target_os = "macos")]
 mod audit_macos;
 
 pub use fs_watcher::FsWatcherManager;
 pub use proxy::ProxyServer;
+#[cfg(target_os = "macos")]
+pub use app_detector_macos::{AppDetectorState, AppEvent, AppInstance, AppKind, AppDetector, MacAppDetector, DEFAULT_POLL_INTERVAL_MS};
 #[cfg(target_os = "macos")]
 pub use audit_macos::AuditCollector;
 

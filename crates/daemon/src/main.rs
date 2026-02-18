@@ -5,6 +5,8 @@ mod pipeline;
 use antidote_api::create_router;
 use antidote_behavior;
 use antidote_collectors::{FsWatcherManager, ProcessPoller, ProxyServer};
+#[cfg(target_os = "macos")]
+use antidote_collectors::{AppDetectorState, AppEvent, AppDetector, MacAppDetector};
 use antidote_core::{
     Event, EventType, Flag, Label, SessionSummary, Severity,
     EnforcementConfig, SafeModeConfig,
@@ -13,6 +15,7 @@ use antidote_ruleengine::RuleEngine;
 use antidote_session::SessionManager;
 use antidote_storage::{AppBaselineRow, Storage};
 use anyhow::{Context, Result};
+use futures::stream::StreamExt;
 use pipeline::PipelineWorker;
 use std::collections::HashMap;
 use time::format_description::well_known::Rfc3339;
@@ -21,8 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::signal;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 /// Unified handle for daemon tasks: some return Result (e.g. API server), others run until cancelled ().
@@ -31,21 +33,28 @@ enum TaskHandle {
     Unit(tokio::task::JoinHandle<()>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
-    db_url: String,
-    listen_addr: String,
-    rules_path: String,
-    watch_processes: Vec<String>,
-    poll_interval_secs: u64,
-    idle_timeout_minutes: u64,
-    fs: FsConfig,
-    proxy: ProxyConfig,
-    retention: RetentionConfig,
-    #[serde(default)]
-    enforcement: EnforcementConfig,
-    #[serde(default)]
-    safe_mode: SafeModeConfig,
+impl TaskHandle {
+    fn abort(&self) {
+        match self {
+            TaskHandle::WithResult(h) => h.abort(),
+            TaskHandle::Unit(h) => h.abort(),
+        }
+    }
+}
+
+async fn await_task_handle(handle: TaskHandle) {
+    match handle {
+        TaskHandle::WithResult(h) => {
+            match h.await {
+                Ok(Err(e)) => warn!("API task error: {}", e),
+                Err(e) => warn!("API task panicked: {}", e),
+                _ => {}
+            }
+        }
+        TaskHandle::Unit(h) => {
+            let _ = h.await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +73,40 @@ struct RetentionConfig {
     days: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppDetectorConfig {
+    enabled: bool,
+    poll_interval_ms: u64,
+}
+
+impl Default for AppDetectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_ms: 2000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    db_url: String,
+    listen_addr: String,
+    rules_path: String,
+    watch_processes: Vec<String>,
+    poll_interval_secs: u64,
+    idle_timeout_minutes: u64,
+    fs: FsConfig,
+    proxy: ProxyConfig,
+    retention: RetentionConfig,
+    #[serde(default)]
+    app_detector: AppDetectorConfig,
+    #[serde(default)]
+    enforcement: EnforcementConfig,
+    #[serde(default)]
+    safe_mode: SafeModeConfig,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -79,6 +122,7 @@ impl Default for Config {
                 listen_addr: "127.0.0.1:17846".to_string(),
             },
             retention: RetentionConfig { days: 7 },
+            app_detector: AppDetectorConfig::default(),
             enforcement: EnforcementConfig::default(),
             safe_mode: SafeModeConfig::default(),
         }
@@ -139,6 +183,27 @@ async fn run_emergency_freeze(
         let _ = storage.insert_flags(&[flag]).await;
     }
     info!("Emergency freeze completed: {} sessions force-terminated", session_ids.len());
+}
+
+/// Wait for process termination signal (Ctrl+C or SIGTERM).
+/// Uses signal-hook-tokio on Unix (reliable under cargo run / subprocess); ctrl_c on Windows.
+async fn wait_for_shutdown_signal() -> Result<(), anyhow::Error> {
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        use signal_hook_tokio::Signals;
+        let mut signals = Signals::new(&[SIGINT, SIGTERM]).context("Failed to register signal handlers")?;
+        // First signal (Ctrl+C or SIGTERM) triggers shutdown
+        let _ = signals.next().await;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("Failed to listen for shutdown signal")
+    }
 }
 
 #[tokio::main]
@@ -251,6 +316,56 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let mut shutdown_rx = shutdown_tx.subscribe();
 
+    // App detector (macOS only): lifecycle events for Cursor/VSCode/Claude
+    #[cfg(target_os = "macos")]
+    let (app_detector_state, app_detector_handle) = {
+        if !config.app_detector.enabled {
+            (None, None)
+        } else {
+            let state = Arc::new(RwLock::new(AppDetectorState::default()));
+            let (app_event_tx, mut app_event_rx) = mpsc::channel::<AppEvent>(64);
+            let detector = MacAppDetector::new(config.app_detector.poll_interval_ms);
+            let mut detector_handle = detector.start(app_event_tx);
+            let consumer_state = state.clone();
+            let consumer_handle = tokio::spawn(async move {
+                let mut by_pid: std::collections::HashMap<i32, antidote_collectors::AppInstance> = std::collections::HashMap::new();
+                while let Some(ev) = app_event_rx.recv().await {
+                    match ev {
+                        AppEvent::Started { app, pid, bundle_id, started_at } => {
+                            info!("App started: {} pid={}", app.as_display_str(), pid);
+                            let instance = antidote_collectors::AppInstance::new(app, pid, bundle_id, started_at);
+                            by_pid.insert(pid, instance);
+                        }
+                        AppEvent::Exited { app, pid, exited_at: _ } => {
+                            info!("App exited: {} pid={}", app.as_display_str(), pid);
+                            by_pid.remove(&pid);
+                        }
+                        AppEvent::ScanComplete { at } => {
+                            let instances: Vec<_> = by_pid.values().cloned().collect();
+                            let mut s = consumer_state.write().await;
+                            s.instances = instances;
+                            s.last_scan_ts = Some(at);
+                        }
+                    }
+                }
+            });
+            let mut shutdown_rx_app = shutdown_tx.subscribe();
+            let join_both = tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_rx_app.recv() => {
+                        detector_handle.abort();
+                        let _ = detector_handle.await;
+                    }
+                    _ = &mut detector_handle => {}
+                }
+                let _ = consumer_handle.await;
+            });
+            (Some(state), Some(join_both))
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let app_detector_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     // Start API server with graceful shutdown
     let api_storage = storage.clone();
     let api_session_manager = session_manager.clone();
@@ -261,7 +376,22 @@ async fn main() -> Result<()> {
     let api_safe_mode = safe_mode_state.clone();
     let api_frozen = frozen_state.clone();
     let api_freeze_tx = freeze_tx.clone();
+    #[cfg(target_os = "macos")]
+    let api_app_detector_state = app_detector_state.clone();
     let api_handle = tokio::spawn(async move {
+        #[cfg(target_os = "macos")]
+        let router = create_router(
+            api_storage,
+            Some(api_session_manager),
+            proxy_enabled,
+            proxy_listen_addr,
+            api_enforcement,
+            api_safe_mode,
+            api_frozen,
+            Some(api_freeze_tx),
+            api_app_detector_state,
+        );
+        #[cfg(not(target_os = "macos"))]
         let router = create_router(
             api_storage,
             Some(api_session_manager),
@@ -523,51 +653,91 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal
+    // Wait for shutdown signal (SIGINT on Unix = Ctrl+C; also SIGTERM on Unix)
     info!("Daemon running. Press Ctrl+C to shutdown.");
-    signal::ctrl_c()
-        .await
-        .context("Failed to listen for shutdown signal")?;
+    wait_for_shutdown_signal().await?;
 
     info!("Shutdown signal received, shutting down...");
 
-    // Signal API server to stop accepting new connections and drain
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+
+    info!("Signaling all tasks to stop...");
     let _ = shutdown_tx.send(());
 
-    // Close event channel so pipeline, poller, tick, proxy exit
+    info!("Closing event and control channels (pipeline, freeze, flags)...");
     drop(event_tx);
     drop(freeze_tx);
     drop(flag_tx);
 
-    // Wait for tasks to complete
-    let mut handles: Vec<TaskHandle> = vec![
-        TaskHandle::WithResult(api_handle),
-        TaskHandle::Unit(poller_handle),
-        TaskHandle::Unit(tick_handle),
-        TaskHandle::Unit(pipeline_handle),
-        TaskHandle::Unit(idle_handle),
-        TaskHandle::Unit(retention_handle),
-        TaskHandle::Unit(flag_handle),
-        TaskHandle::Unit(freeze_handle),
+    let mut task_list: Vec<(&'static str, TaskHandle)> = vec![
+        ("API server", TaskHandle::WithResult(api_handle)),
+        ("process poller", TaskHandle::Unit(poller_handle)),
+        ("tick emitter", TaskHandle::Unit(tick_handle)),
+        ("pipeline worker", TaskHandle::Unit(pipeline_handle)),
+        ("idle/baseline task", TaskHandle::Unit(idle_handle)),
+        ("retention pruner", TaskHandle::Unit(retention_handle)),
+        ("flag consumer", TaskHandle::Unit(flag_handle)),
+        ("freeze handler", TaskHandle::Unit(freeze_handle)),
     ];
     if let Some(proxy_h) = proxy_handle {
-        handles.push(TaskHandle::Unit(proxy_h));
+        task_list.push(("proxy server", TaskHandle::Unit(proxy_h)));
     }
-    for handle in handles {
-        match handle {
-            TaskHandle::WithResult(h) => {
-                match h.await {
-                    Ok(Err(e)) => warn!("API task error: {}", e),
-                    Err(e) => warn!("API task panicked: {}", e),
-                    _ => {}
+    if let Some(app_detector_h) = app_detector_handle {
+        task_list.push(("app detector", TaskHandle::Unit(app_detector_h)));
+    }
+
+    let tasks = Arc::new(Mutex::new(task_list));
+    let tasks_clone = Arc::clone(&tasks);
+    // When timeout hits, we may be in the middle of awaiting one task (e.g. pipeline worker).
+    // Track it so we can abort it too.
+    let current_awaiting: Arc<Mutex<Option<(&'static str, TaskHandle)>>> = Arc::new(Mutex::new(None));
+    let current_awaiting_clone = Arc::clone(&current_awaiting);
+
+    let join_all = async move {
+        loop {
+            let next = {
+                let mut guard = tasks_clone.lock().await;
+                if guard.is_empty() {
+                    None
+                } else {
+                    Some(guard.remove(0))
                 }
-            }
-            TaskHandle::Unit(h) => {
-                let _ = h.await;
-            }
+            };
+            let Some((name, handle)) = next else { break };
+            info!("  Waiting for {}...", name);
+            *current_awaiting_clone.lock().await = Some((name, handle));
+            let (name, handle) = current_awaiting_clone.lock().await.take().unwrap();
+            await_task_handle(handle).await;
+            info!("  {} stopped.", name);
+        }
+    };
+
+    info!("Waiting for tasks to finish (timeout {}s)...", SHUTDOWN_TIMEOUT.as_secs());
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, join_all).await.is_err() {
+        info!(
+            "Shutdown timeout ({}s) reached, forcing remaining tasks to stop.",
+            SHUTDOWN_TIMEOUT.as_secs()
+        );
+        // Abort the task we were waiting on when the timeout hit (e.g. pipeline worker)
+        if let Some((name, handle)) = current_awaiting.lock().await.take() {
+            info!("  Aborting {}...", name);
+            handle.abort();
+            await_task_handle(handle).await;
+            info!("  {} stopped (forced).", name);
+        }
+        // Abort any tasks still in the list (not yet started waiting on)
+        let remaining = {
+            let mut guard = tasks.lock().await;
+            guard.drain(..).collect::<Vec<_>>()
+        };
+        for (name, handle) in remaining {
+            info!("  Aborting {}...", name);
+            handle.abort();
+            await_task_handle(handle).await;
+            info!("  {} stopped (forced).", name);
         }
     }
 
-    info!("Shutdown complete");
+    info!("Shutdown complete.");
     Ok(())
 }

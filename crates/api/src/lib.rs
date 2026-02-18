@@ -30,6 +30,9 @@ pub struct ApiState {
     pub frozen: Arc<tokio::sync::RwLock<bool>>,
     /// Phase 6: Signal daemon to run freeze (kill sessions). None if not provided.
     pub freeze_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// App detector state (macOS only); used by GET /debug/apps
+    #[cfg(target_os = "macos")]
+    pub app_detector_state: Option<Arc<tokio::sync::RwLock<antidote_collectors::AppDetectorState>>>,
 }
 
 /// Health check response
@@ -61,7 +64,35 @@ pub struct ListParams {
     pub until: Option<String>,
 }
 
-/// Create the API router
+/// Create the API router. On macOS, pass `app_detector_state` for GET /debug/apps.
+#[cfg(target_os = "macos")]
+pub fn create_router(
+    storage: Arc<Storage>,
+    session_manager: Option<Arc<SessionManager>>,
+    proxy_enabled: bool,
+    proxy_listen_addr: String,
+    enforcement: Arc<tokio::sync::RwLock<EnforcementConfig>>,
+    safe_mode: Arc<tokio::sync::RwLock<SafeModeConfig>>,
+    frozen: Arc<tokio::sync::RwLock<bool>>,
+    freeze_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    app_detector_state: Option<Arc<tokio::sync::RwLock<antidote_collectors::AppDetectorState>>>,
+) -> Router {
+    let state = ApiState {
+        storage,
+        session_manager,
+        proxy_enabled,
+        proxy_listen_addr,
+        enforcement,
+        safe_mode,
+        frozen,
+        freeze_tx,
+        app_detector_state,
+    };
+    create_router_routes(state)
+}
+
+/// Create the API router (non-macOS: no app detector).
+#[cfg(not(target_os = "macos"))]
 pub fn create_router(
     storage: Arc<Storage>,
     session_manager: Option<Arc<SessionManager>>,
@@ -82,7 +113,46 @@ pub fn create_router(
         frozen,
         freeze_tx,
     };
+    create_router_routes(state)
+}
 
+#[cfg(target_os = "macos")]
+fn create_router_routes(state: ApiState) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/debug/apps", get(debug_apps_handler))
+        .route("/sessions", get(list_sessions_handler))
+        .route("/sessions/:id", get(get_session_handler))
+        .route("/sessions/:id/summary", get(get_session_summary_handler))
+        .route("/sessions/:id/events", get(list_events_handler))
+        .route("/sessions/:id/flags", get(list_flags_handler))
+        .route("/roots", get(list_roots_handler))
+        .route("/roots", post(add_root_handler))
+        .route("/roots/:id", axum::routing::delete(delete_root_handler))
+        .route("/roots/:id/enable", post(enable_root_handler))
+        .route("/proxy/status", get(proxy_status_handler))
+        .route("/debug/emit", post(emit_event_handler))
+        .route("/debug/sessions/active", get(list_active_sessions_handler))
+        .route("/debug/focus", get(get_focus_handler))
+        .route("/debug/focus", post(set_focus_handler))
+        .route("/debug/db", get(db_health_handler))
+        .route("/debug/prune", post(prune_handler))
+        .route("/capabilities", get(capabilities_handler))
+        .route("/ui", get(ui_redirect_handler))
+        .route("/ui/", get(ui_index_handler))
+        .route("/ui/insights", get(ui_insights_handler))
+        .route("/ui/*path", get(ui_static_handler))
+        .route("/baselines", get(baselines_handler))
+        .route("/insights", get(insights_handler))
+        .route("/enforcement", get(enforcement_get_handler).post(enforcement_post_handler))
+        .route("/emergency/freeze", post(emergency_freeze_handler))
+        .route("/emergency/unfreeze", post(emergency_unfreeze_handler))
+        .route("/ui/security", get(ui_security_handler))
+        .with_state(state)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_router_routes(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/sessions", get(list_sessions_handler))
@@ -113,6 +183,56 @@ pub fn create_router(
         .route("/emergency/unfreeze", post(emergency_unfreeze_handler))
         .route("/ui/security", get(ui_security_handler))
         .with_state(state)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize)]
+struct DebugAppsResponse {
+    detected: Vec<DebugAppDto>,
+    last_scan_ts: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize)]
+struct DebugAppDto {
+    app: antidote_collectors::AppKind,
+    pid: i32,
+    bundle_id: Option<String>,
+    started_at: String,
+}
+
+#[cfg(target_os = "macos")]
+async fn debug_apps_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<DebugAppsResponse>, StatusCode> {
+    let Some(ref guard) = state.app_detector_state else {
+        return Ok(Json(DebugAppsResponse {
+            detected: vec![],
+            last_scan_ts: None,
+        }));
+    };
+    let s = guard.read().await;
+    let detected: Vec<DebugAppDto> = s
+        .instances
+        .iter()
+        .map(|i| DebugAppDto {
+            app: i.app.clone(),
+            pid: i.pid,
+            bundle_id: i.bundle_id.clone(),
+            started_at: i
+                .started_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect();
+    let last_scan_ts = s
+        .last_scan_ts
+        .map(|t| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default().to_string());
+    Ok(Json(DebugAppsResponse {
+        detected,
+        last_scan_ts,
+    }))
 }
 
 async fn health_handler() -> Json<HealthResponse> {

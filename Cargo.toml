@@ -59,3 +59,7 @@ hyper = "1.0"
 hyper-util = "0.1"
 http-body-util = "0.1"
 futures = "0.3"
+
+# Reliable signal handling (when tokio's ctrl_c doesn't work, e.g. under cargo run on macOS)
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
