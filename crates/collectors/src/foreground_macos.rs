@@ -35,22 +35,50 @@ impl ForegroundPoller {
         Arc::clone(&self.state)
     }
 
+    /// Runs the poller. If `activate_rx` is Some, receives event-driven foreground updates
+    /// from NSWorkspace activate observer; poll is reconciliation-only (e.g. 30s).
     pub async fn run(
         self,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        mut activate_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ForegroundApp>>,
     ) {
         let mut ticker = tokio::time::interval(Duration::from_millis(self.interval_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Initial poll on startup (design: "poll on daemon start to get initial state")
+        let app = Self::poll_once().await;
+        if let Some(ref a) = app {
+            debug!("Foreground app (initial): {} pid={:?}", a.name, a.pid);
+        }
+        *self.state.write().await = app;
+
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let app = Self::poll_once().await;
-                    if let Some(ref a) = app {
-                        debug!("Foreground app: {} pid={:?}", a.name, a.pid);
+            if let Some(ref mut rx) = activate_rx {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let app = Self::poll_once().await;
+                        if let Some(ref a) = app {
+                            debug!("Foreground app (poll): {} pid={:?}", a.name, a.pid);
+                        }
+                        *self.state.write().await = app;
                     }
-                    *self.state.write().await = app;
+                    Some(app) = rx.recv() => {
+                        debug!("Foreground app (activate): {} pid={:?}", app.name, app.pid);
+                        *self.state.write().await = Some(app);
+                    }
+                    _ = shutdown_rx.recv() => break,
                 }
-                _ = shutdown_rx.recv() => break,
+            } else {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let app = Self::poll_once().await;
+                        if let Some(ref a) = app {
+                            debug!("Foreground app (poll): {} pid={:?}", a.name, a.pid);
+                        }
+                        *self.state.write().await = app;
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
             }
         }
     }

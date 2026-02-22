@@ -25,7 +25,7 @@ export default function SessionDetail() {
       <p style={{ color: "var(--text-muted)" }}>Session not found</p>
     );
 
-  const { session, top_findings, touched_files, domains, recent_events, diagnostics } = data;
+  const { session, candidate_roots, observed_roots, top_findings, touched_files, domains, recent_events, diagnostics } = data;
   const dur = session.duration_seconds ?? 0;
 
   return (
@@ -83,6 +83,35 @@ export default function SessionDetail() {
           </div>
         </Card>
       </div>
+
+      {(candidate_roots.length > 0 || observed_roots.length > 0) && (
+        <Card title="Session Roots">
+          {candidate_roots.length > 0 && (
+            <div style={{ marginBottom: observed_roots.length > 0 ? "1rem" : 0 }}>
+              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: "0.25rem" }}>
+                Candidate roots (at session start)
+              </div>
+              <ul style={{ listStyle: "none", fontSize: "0.85rem", fontFamily: "monospace", margin: 0, padding: 0 }}>
+                {candidate_roots.map((r, i) => (
+                  <li key={i} style={{ padding: "0.2rem 0", wordBreak: "break-all" }}>{r}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {observed_roots.length > 0 && (
+            <div>
+              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: "0.25rem" }}>
+                Observed roots (paths that saw activity)
+              </div>
+              <ul style={{ listStyle: "none", fontSize: "0.85rem", fontFamily: "monospace", margin: 0, padding: 0 }}>
+                {observed_roots.map((r, i) => (
+                  <li key={i} style={{ padding: "0.2rem 0", wordBreak: "break-all" }}>{r}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </Card>
+      )}
 
       {top_findings.length > 0 && (
         <Card title="Top Findings">
@@ -179,7 +208,7 @@ export default function SessionDetail() {
                 color: "var(--text)",
               }}
             >
-              {eventsExpanded ? "Collapse" : "Expand"}
+              {eventsExpanded ? "Collapse" : "Show raw timeline"}
             </button>
           </span>
         }
@@ -190,18 +219,48 @@ export default function SessionDetail() {
               <li
                 key={i}
                 style={{
-                  padding: "0.35rem 0",
+                  padding: "0.5rem 0",
                   borderBottom: "1px solid var(--border)",
                   fontFamily: "monospace",
+                  fontSize: "0.8rem",
                 }}
               >
-                {formatDate(e.ts)} [{e.kind}] {e.summary}
-                {e.attribution_reason && (
-                  <span style={{ color: "var(--text-muted)" }}>
-                    {" "}
-                    attr={e.attribution_reason}
-                    {e.confidence && ` conf=${e.confidence}`}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.25rem 1rem", alignItems: "baseline" }}>
+                  <span style={{ color: "var(--text-muted)", flexShrink: 0 }}>{formatDate(e.ts)}</span>
+                  <span
+                    style={{
+                      padding: "0.1rem 0.35rem",
+                      borderRadius: 3,
+                      background: e.kind === "fs" ? "rgba(255,193,7,0.2)" : e.kind === "net" ? "rgba(33,150,243,0.2)" : e.kind === "cmd" ? "rgba(76,175,80,0.2)" : "var(--surface-hover)",
+                      fontSize: "0.7rem",
+                    }}
+                  >
+                    {e.event_type}
                   </span>
+                  <span>{e.summary}</span>
+                  {e.details?.path && (
+                    <span style={{ color: "var(--accent)", wordBreak: "break-all" }} title={e.details.path}>
+                      {e.details.rel_path ?? e.details.path}
+                    </span>
+                  )}
+                  {e.details?.bytes != null && (
+                    <span style={{ color: "var(--text-muted)" }}>({e.details.bytes} B)</span>
+                  )}
+                  {e.details?.bytes_in != null && (
+                    <span style={{ color: "var(--text-muted)" }}>in: {e.details.bytes_in} B</span>
+                  )}
+                  {e.details?.bytes_out != null && (
+                    <span style={{ color: "var(--text-muted)" }}>out: {e.details.bytes_out} B</span>
+                  )}
+                  {e.details?.argv && e.details.argv.length > 0 && (
+                    <span style={{ color: "var(--text-muted)" }}>argv: {e.details.argv.join(" ")}</span>
+                  )}
+                </div>
+                {e.attribution_reason && (
+                  <div style={{ fontSize: "0.7rem", color: "var(--text-muted)", marginTop: "0.2rem" }}>
+                    attr={e.attribution_reason}
+                    {e.confidence != null && ` conf=${e.confidence}`}
+                  </div>
                 )}
               </li>
             ))}
@@ -213,9 +272,9 @@ export default function SessionDetail() {
         )}
       </Card>
 
-      <Card title="Diagnostics">
+      <Card title="Telemetry">
         <div style={{ fontSize: "0.9rem" }}>
-          Telemetry: {diagnostics.telemetry_confidence} · Attribution:{" "}
+          Confidence: {diagnostics.telemetry_confidence} · Attribution quality:{" "}
           {(diagnostics.attribution_quality * 100).toFixed(0)}% · Root coverage:{" "}
           {(diagnostics.root_coverage * 100).toFixed(0)}%
         </div>

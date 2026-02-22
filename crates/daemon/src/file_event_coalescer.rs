@@ -1,5 +1,8 @@
 //! Step 6: Coalesce rapid file writes into single events with repeat_count.
 //! Also applies ignore filter (node_modules, .git, etc.) before coalescing.
+//!
+//! Phase 3: Event-triggered debounce flush — no fixed ticker. Sleep until earliest
+//! pending goes stale; each new event recalculates. Batch size threshold flushes early.
 
 use crate::ignore_filters;
 use antidote_core::{Event, EventType};
@@ -60,6 +63,11 @@ impl FileEventCoalescer {
             return vec![event];
         }
 
+        // Emit sensitive paths immediately (no coalescing) so .env, .pem etc. are detected promptly
+        if ignore_filters::is_sensitive_path(&path) {
+            return vec![event];
+        }
+
         let key = CoalesceKey {
             path: path.clone(),
             event_type: event.event_type,
@@ -95,7 +103,20 @@ impl FileEventCoalescer {
         to_emit
     }
 
-    /// Flush pending events that have exceeded the window. Call periodically.
+    /// Earliest time at which any pending event becomes stale. None if no pending.
+    pub fn earliest_stale_time(&self) -> Option<OffsetDateTime> {
+        self.pending
+            .values()
+            .map(|p| p.first_ts + time::Duration::milliseconds(self.window.as_millis() as i64))
+            .min()
+    }
+
+    /// Number of pending coalesce keys.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Flush pending events that have exceeded the window. Call when deadline reached or batch full.
     pub fn flush_stale(&mut self, now: OffsetDateTime) -> Vec<Event> {
         let mut out = Vec::new();
         let mut stale_keys = Vec::new();
@@ -118,18 +139,30 @@ impl FileEventCoalescer {
     }
 }
 
+/// Batch size threshold: flush immediately when this many pending keys (design: 50).
+const FLUSH_BATCH_THRESHOLD: usize = 50;
+
 /// Task that receives events, coalesces file events, and forwards to output channel.
+/// Event-triggered flush: sleep until earliest pending goes stale; each new event
+/// recalculates. No fixed ticker.
 pub async fn coalescer_task(
     mut rx: mpsc::UnboundedReceiver<Event>,
     tx: mpsc::UnboundedSender<Event>,
     coalesce_window_ms: u64,
 ) {
     let mut coalescer = FileEventCoalescer::new(coalesce_window_ms);
-    let flush_interval = Duration::from_millis(coalesce_window_ms / 2).max(Duration::from_millis(100));
-    let mut flush_ticker = tokio::time::interval(flush_interval);
-    flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        let sleep_fut = async {
+            if let Some(stale_at) = coalescer.earliest_stale_time() {
+                let now = time::OffsetDateTime::now_utc();
+                let wait_ms = (stale_at - now).whole_milliseconds().max(0) as u64;
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
@@ -140,11 +173,19 @@ pub async fn coalescer_task(
                                 break;
                             }
                         }
+                        // Batch threshold: flush early if too many pending
+                        if coalescer.pending_len() >= FLUSH_BATCH_THRESHOLD {
+                            for ev in coalescer.flush_stale(now) {
+                                if tx.send(ev).is_err() {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     None => break,
                 }
             }
-            _ = flush_ticker.tick() => {
+            _ = sleep_fut => {
                 let now = time::OffsetDateTime::now_utc();
                 for ev in coalescer.flush_stale(now) {
                     if tx.send(ev).is_err() {

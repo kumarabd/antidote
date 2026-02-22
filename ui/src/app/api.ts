@@ -31,4 +31,21 @@ export const api = {
     fetchJsonOptional<unknown>("/debug/zero_config_status"),
   debugHealth: () => fetchJson<unknown>("/debug/health"),
   debugConfidence: () => fetchJson<unknown>("/debug/confidence"),
+  exportDiagnostics: async (params?: { include_logs?: boolean; include_config?: boolean }) => {
+    const q = new URLSearchParams();
+    if (params?.include_logs !== undefined) q.set("include_logs", String(params.include_logs));
+    if (params?.include_config !== undefined) q.set("include_config", String(params.include_config));
+    const res = await fetch(`/support/diagnostics/export?${q}`, { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition");
+    const match = cd?.match(/filename="?([^";\n]+)"?/);
+    const filename = match?.[1] || `antidote-diagnostics-${Date.now()}.zip`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
 };

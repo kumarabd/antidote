@@ -37,6 +37,7 @@ pub enum AppEvent {
     Started {
         app: AppKind,
         pid: i32,
+        process_name: Option<String>,
         bundle_id: Option<String>,
         started_at: OffsetDateTime,
     },
@@ -70,7 +71,8 @@ impl AppInstance {
 }
 
 /// Signature for matching a supported app (process names; bundle_ids optional in v1).
-struct AppSignature {
+#[derive(Clone)]
+pub struct AppSignature {
     app: AppKind,
     /// Main process name(s) only (e.g. "Cursor" for the app, not "Cursor Helper").
     names: Vec<&'static str>,
@@ -78,8 +80,9 @@ struct AppSignature {
     main_process_only: bool,
 }
 
-fn default_signatures() -> Vec<AppSignature> {
+pub fn default_signatures() -> Vec<AppSignature> {
     vec![
+        // Main processes: one session per app
         AppSignature {
             app: AppKind::Cursor,
             names: vec!["Cursor"],
@@ -88,18 +91,29 @@ fn default_signatures() -> Vec<AppSignature> {
         AppSignature {
             app: AppKind::VSCode,
             names: vec!["Code", "Visual Studio Code", "code"],
-            main_process_only: false,
+            main_process_only: true,
         },
         AppSignature {
             app: AppKind::Claude,
             names: vec!["Claude"],
-            main_process_only: false,
+            main_process_only: true,
+        },
+        // Renderer processes: one session per window (exact match only)
+        AppSignature {
+            app: AppKind::Cursor,
+            names: vec!["Cursor Helper (Renderer)"],
+            main_process_only: true,
+        },
+        AppSignature {
+            app: AppKind::VSCode,
+            names: vec!["Code Helper (Renderer)", "Code - Renderer"],
+            main_process_only: true,
         },
     ]
 }
 
 /// Match a process name to a supported app; returns None if helper should be ignored or no match.
-fn match_app(comm: &str, signatures: &[AppSignature]) -> Option<AppKind> {
+pub fn match_app(comm: &str, signatures: &[AppSignature]) -> Option<AppKind> {
     let comm_lower = comm.to_lowercase();
     for sig in signatures {
         if sig.main_process_only {
@@ -195,6 +209,7 @@ impl AppDetector for MacAppDetector {
                             .send(AppEvent::Started {
                                 app: app.clone(),
                                 pid: *pid,
+                                process_name: Some(_name.clone()),
                                 bundle_id: None,
                                 started_at: now,
                             })
@@ -263,6 +278,25 @@ mod tests {
         assert_eq!(match_app("Code", &sigs), Some(AppKind::VSCode));
         assert_eq!(match_app("code", &sigs), Some(AppKind::VSCode));
         assert_eq!(match_app("Visual Studio Code", &sigs), Some(AppKind::VSCode));
+    }
+
+    #[test]
+    fn vscode_helper_ignored_non_renderer() {
+        let sigs = default_signatures();
+        assert_eq!(match_app("Code Helper", &sigs), None);
+    }
+
+    #[test]
+    fn vscode_renderer_matches() {
+        let sigs = default_signatures();
+        assert_eq!(match_app("Code Helper (Renderer)", &sigs), Some(AppKind::VSCode));
+        assert_eq!(match_app("Code - Renderer", &sigs), Some(AppKind::VSCode));
+    }
+
+    #[test]
+    fn cursor_renderer_matches() {
+        let sigs = default_signatures();
+        assert_eq!(match_app("Cursor Helper (Renderer)", &sigs), Some(AppKind::Cursor));
     }
 
     #[test]

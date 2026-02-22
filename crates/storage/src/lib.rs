@@ -17,6 +17,43 @@ fn parse_session_ts(s: &str) -> OffsetDateTime {
     OffsetDateTime::parse(s, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH)
 }
 
+/// A3: Try DB recovery - if integrity check fails, move corrupt DB aside. Returns true if recovery was performed.
+pub async fn try_recover_db(db_url: &str) -> Result<bool> {
+    let path_str = db_url
+        .strip_prefix("sqlite:")
+        .unwrap_or(db_url)
+        .trim_start_matches("./");
+    let path = Path::new(path_str);
+    let absolute: PathBuf = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to get current directory")?
+            .join(path_str)
+    };
+    if !absolute.exists() {
+        return Ok(false);
+    }
+    let url = format!("sqlite://{}", absolute.display());
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .context("Failed to connect to DB for integrity check")?;
+    let row: (String,) = sqlx::query_as("PRAGMA quick_check")
+        .fetch_one(&pool)
+        .await
+        .context("PRAGMA quick_check failed")?;
+    pool.close().await;
+    if row.0.to_uppercase() == "OK" {
+        return Ok(false);
+    }
+    let ts = time::OffsetDateTime::now_utc().unix_timestamp();
+    let corrupt_path = absolute.with_extension(format!("db.corrupt.{}", ts));
+    std::fs::rename(&absolute, &corrupt_path).context("Failed to move corrupt DB")?;
+    Ok(true)
+}
+
 /// Storage handle for database operations
 pub struct Storage {
     pool: SqlitePool,

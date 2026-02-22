@@ -31,6 +31,21 @@ pub const IGNORE_TOOL_PATHS: &[&str] = &[
     ".idea",
 ];
 
+/// Paths matching these patterns are sensitive; do not coalesce (emit immediately).
+pub fn is_sensitive_path(path: &str) -> bool {
+    let path_lower = path.to_lowercase();
+    path_lower.ends_with(".env")
+        || path_lower.ends_with(".pem")
+        || path_lower.contains("/.env")
+        || path_lower.contains("\\.env")
+        || path_lower.contains("/.ssh/")
+        || path_lower.contains("\\.ssh\\")
+        || path_lower.contains("secrets")
+        || path_lower.contains("credentials")
+        || path_lower.contains("id_rsa")
+        || path_lower.contains("id_ed25519")
+}
+
 /// Check if a path should be ignored (dropped).
 pub fn should_ignore_path(path: &str) -> bool {
     let path_lower = path.to_lowercase();

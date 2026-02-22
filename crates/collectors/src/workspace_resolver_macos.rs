@@ -2,6 +2,7 @@
 //! app storage JSON, window title, or lsof. Emits WorkspaceEvent::Updated for downstream use.
 
 use crate::app_detector_macos::{AppDetectorState, AppKind};
+use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, RwLock};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +43,12 @@ pub enum WorkspaceEvent {
         roots: Vec<String>,
         confidence: Confidence,
         observed_at: OffsetDateTime,
+    },
+    /// Emitted when roots are no longer present for a (app, pid) (window closed, folder removed).
+    RootsRemoved {
+        app: AppKind,
+        pid: i32,
+        roots: Vec<String>,
     },
 }
 
@@ -249,19 +256,37 @@ fn extract_roots_from_value(v: &serde_json::Value, out: &mut Vec<String>) {
         serde_json::Value::Object(m) => {
             for (k, val) in m {
                 let key_lower = k.to_lowercase();
+                // Single path/URI fields
                 if (key_lower == "folderuri" || key_lower == "fileuri" || key_lower == "path" || key_lower == "folder")
                     && val.is_string()
                 {
                     if let Some(s) = val.as_str() {
-                        if let Some(path) = file_uri_to_path(s).or_else(|| {
-                            if s.starts_with('/') || s.starts_with("file:") {
-                                file_uri_to_path(s)
-                            } else {
-                                Some(expand_tilde(s))
-                            }
-                        }) {
+                        if let Some(path) = path_from_str(s) {
                             if std::path::Path::new(&path).exists() {
                                 out.push(path);
+                            }
+                        }
+                    }
+                }
+                // Multi-root workspace: "folders" array of {path, folder, folderUri, ...}
+                if key_lower == "folders" {
+                    if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if let Some(obj) = item.as_object() {
+                                for (fk, fv) in obj {
+                                    let fk_lower = fk.to_lowercase();
+                                    if (fk_lower == "path" || fk_lower == "folder" || fk_lower == "folderuri" || fk_lower == "uri")
+                                        && fv.is_string()
+                                    {
+                                        if let Some(s) = fv.as_str() {
+                                            if let Some(path) = path_from_str(s) {
+                                                if std::path::Path::new(&path).exists() {
+                                                    out.push(path);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -280,6 +305,16 @@ fn extract_roots_from_value(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+fn path_from_str(s: &str) -> Option<String> {
+    file_uri_to_path(s).or_else(|| {
+        if s.starts_with('/') || s.starts_with("file:") {
+            file_uri_to_path(s)
+        } else {
+            Some(expand_tilde(s))
+        }
+    })
+}
+
 /// Candidate JSON paths for Cursor and VSCode (under Application Support).
 fn cursor_storage_candidates() -> Vec<String> {
     let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
@@ -292,6 +327,16 @@ fn cursor_storage_candidates() -> Vec<String> {
         let dir = if sub.is_empty() { base.clone() } else { format!("{}/{}", base, sub) };
         for name in ["storage.json", "recentlyOpened.json", "state.json"] {
             out.push(format!("{}/{}", dir, name));
+        }
+    }
+    // workspaceStorage: each subdir has workspace.json with folder(s) for that workspace
+    let ws_storage = format!("{}/User/workspaceStorage", base);
+    if let Ok(entries) = std::fs::read_dir(&ws_storage) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.push(p.join("workspace.json").to_string_lossy().to_string());
+            }
         }
     }
     // Recursive glob under Cursor
@@ -314,11 +359,39 @@ fn vscode_storage_candidates() -> Vec<String> {
         return vec![];
     }
     let base = format!("{}/Library/Application Support/Code", home);
-    vec![
+    let mut out = vec![
         format!("{}/User/globalStorage/storage.json", base),
         format!("{}/storage.json", base),
-        format!("{}/User/globalStorage/state.vscdb", base), // skip in v1
-    ]
+    ];
+    // workspaceStorage: each subdir has workspace.json with folder(s) for that workspace
+    let ws_storage = format!("{}/User/workspaceStorage", base);
+    if let Ok(entries) = std::fs::read_dir(&ws_storage) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.push(p.join("workspace.json").to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Directories to watch for workspace changes (FSEvents). When these change, resolver re-runs.
+fn workspace_storage_watch_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_default();
+    if home.is_empty() {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    for app in ["Cursor", "Code"] {
+        let base = PathBuf::from(&home).join("Library/Application Support").join(app);
+        if base.exists() {
+            out.push(base);
+        }
+    }
+    out
 }
 
 pub fn resolve_tier1<F: FileReader>(
@@ -528,7 +601,7 @@ pub struct WorkspaceResolverConfig {
 impl Default for WorkspaceResolverConfig {
     fn default() -> Self {
         Self {
-            poll_interval_ms: 5000,
+            poll_interval_ms: 30_000, // 30s fallback; FSEvents on storage dirs provides event-driven wake
             max_roots_per_app: 5,
             dev_dir_candidates: vec![
                 "~/code".into(),
@@ -546,6 +619,46 @@ impl Default for WorkspaceResolverConfig {
 /// Key for workspace state map: (AppKind, pid). We use (String, i32) for serialization.
 fn app_pid_key(app: &AppKind, pid: i32) -> (String, i32) {
     (app.as_display_str().to_string(), pid)
+}
+
+/// Watches Cursor/VSCode storage dirs with FSEvents; sends wake signals to trigger resolver.
+/// Spawn this task; it runs until shutdown. Pass the receiver to resolver.run() as wake_rx.
+pub fn spawn_storage_watcher(
+    wake_tx: mpsc::UnboundedSender<()>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    let dirs = workspace_storage_watch_dirs();
+    if dirs.is_empty() {
+        return tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+        });
+    }
+    tokio::spawn(async move {
+        let mut w = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if res.is_ok() {
+                let _ = wake_tx.send(());
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("Workspace storage watcher failed to create: {}", e);
+                return;
+            }
+        };
+        for dir in &dirs {
+            if let Err(e) = w.watch(dir, RecursiveMode::Recursive) {
+                warn!("Failed to watch {:?}: {}", dir, e);
+            } else {
+                debug!("Watching workspace storage: {:?}", dir);
+            }
+        }
+        info!(
+            "Workspace storage watcher active ({} dirs), event-driven mode",
+            dirs.len()
+        );
+        // Keep watcher alive until shutdown
+        let _ = shutdown_rx.recv().await;
+    })
 }
 
 /// Workspace resolver: polls app state and resolves roots per Cursor/VSCode instance.
@@ -632,10 +745,13 @@ impl WorkspaceResolver {
         (vec![], Confidence::High, SourceTier::Tier1)
     }
 
+    /// Run the resolver. Pass wake_rx from spawn_storage_watcher for event-driven re-resolution
+    /// when Cursor/VSCode storage files change; otherwise pass a channel that never receives.
     pub async fn run(
         &self,
         app_state: Arc<RwLock<AppDetectorState>>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        mut wake_rx: mpsc::UnboundedReceiver<()>,
     ) {
         let mut ticker = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -647,11 +763,19 @@ impl WorkspaceResolver {
                     info!("Workspace resolver shutting down");
                     return;
                 }
+                _ = wake_rx.recv() => {
+                    debug!("Workspace storage changed, re-resolving");
+                }
             }
 
             let instances = {
                 let s = app_state.read().await;
                 s.instances.clone()
+            };
+
+            let prev_items = {
+                let s = self.state.read().await;
+                s.items.clone()
             };
 
             // Only Cursor and VSCode for v1
@@ -706,6 +830,27 @@ impl WorkspaceResolver {
                             roots,
                             confidence,
                             observed_at,
+                        });
+                    }
+                }
+            }
+
+            // Emit RootsRemoved for (app, pid) that had roots before but are now gone or empty
+            let new_keys: HashSet<_> = new_items.iter().map(|i| app_pid_key(&i.app, i.pid)).collect();
+            for old in &prev_items {
+                let key = app_pid_key(&old.app, old.pid);
+                if !old.roots.is_empty() && !new_keys.contains(&key) {
+                    info!(
+                        "Workspace roots removed: {} pid={} roots={:?}",
+                        old.app.as_display_str(),
+                        old.pid,
+                        old.roots
+                    );
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(WorkspaceEvent::RootsRemoved {
+                            app: old.app.clone(),
+                            pid: old.pid,
+                            roots: old.roots.clone(),
                         });
                     }
                 }

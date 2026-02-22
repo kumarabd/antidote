@@ -2,26 +2,85 @@
 
 use antidote_core::{payloads::FilePayload, Event, EventType};
 use anyhow::{Context, Result};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    event::RenameMode,
+    Config, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// Options for FS watcher backend. PollWatcher is more reliable for paths like /tmp on macOS
+/// where FSEvents may miss events for "unowned" files.
+#[derive(Debug, Clone)]
+pub struct FsWatcherOptions {
+    /// Use PollWatcher instead of platform-native (FSEvents on macOS). Fixes missed events.
+    pub use_poll_watcher: bool,
+    /// Poll interval in ms when use_poll_watcher is true. Default 1000.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for FsWatcherOptions {
+    fn default() -> Self {
+        Self {
+            use_poll_watcher: false,
+            poll_interval_ms: 1000,
+        }
+    }
+}
+
+/// Inner watcher: either platform-native or PollWatcher.
+enum WatcherImpl {
+    Recommended(RecommendedWatcher),
+    Poll(PollWatcher),
+}
+
+impl WatcherImpl {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> Result<()> {
+        match self {
+            WatcherImpl::Recommended(w) => w.watch(path, mode).map_err(anyhow::Error::from),
+            WatcherImpl::Poll(w) => w.watch(path, mode).map_err(anyhow::Error::from),
+        }
+    }
+    fn unwatch(&mut self, path: &Path) -> Result<()> {
+        match self {
+            WatcherImpl::Recommended(w) => w.unwatch(path).map_err(anyhow::Error::from),
+            WatcherImpl::Poll(w) => w.unwatch(path).map_err(anyhow::Error::from),
+        }
+    }
+}
+
 /// File system watcher manager
 pub struct FsWatcherManager {
     event_tx: mpsc::UnboundedSender<Event>,
-    watchers: HashMap<PathBuf, RecommendedWatcher>,
+    watchers: HashMap<PathBuf, WatcherImpl>,
+    options: FsWatcherOptions,
+    /// Optional channel to emit heartbeat (root path) on each event for supervisor.
+    heartbeat_tx: Option<mpsc::UnboundedSender<PathBuf>>,
 }
 
 impl FsWatcherManager {
     pub fn new(event_tx: mpsc::UnboundedSender<Event>) -> Self {
+        Self::new_with_options(event_tx, FsWatcherOptions::default())
+    }
+
+    pub fn new_with_options(event_tx: mpsc::UnboundedSender<Event>, options: FsWatcherOptions) -> Self {
         Self {
             event_tx,
             watchers: HashMap::new(),
+            options,
+            heartbeat_tx: None,
         }
+    }
+
+    /// Set heartbeat sender for watcher self-heal (emits root path on each event).
+    pub fn with_heartbeat_tx(mut self, tx: mpsc::UnboundedSender<PathBuf>) -> Self {
+        self.heartbeat_tx = Some(tx);
+        self
     }
 
     /// Add a watch root
@@ -34,79 +93,38 @@ impl FsWatcherManager {
             return Ok(());
         }
 
-        info!("Adding FS watch root: {:?}", root_canonical);
+        info!("Adding FS watch root: {:?} (backend={})", root_canonical,
+            if self.options.use_poll_watcher { "PollWatcher" } else { "native" });
 
-        let event_tx = self.event_tx.clone();
-        let root_clone = root_canonical.clone();
-
-        let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            match res {
-                Ok(event) => {
-                    for path in &event.paths {
-                        let path_canonical = match path.canonicalize() {
-                            Ok(p) => p,
-                            Err(_) => path.clone(),
-                        };
-
-                        // Determine event type
-                        let event_type = match &event.kind {
-                            EventKind::Create(_) => EventType::FileCreate,
-                            EventKind::Modify(ref m) => {
-                                // Check if it's a rename (name change) or data modification
-                                if let notify::event::ModifyKind::Name(_) = m {
-                                    EventType::FileRename
-                                } else {
-                                    EventType::FileWrite
-                                }
-                            },
-                            EventKind::Remove(_) => EventType::FileDelete,
-                            _ => continue,
-                        };
-
-                        // Compute relative path
-                        let rel_path = path_canonical
-                            .strip_prefix(&root_clone)
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| path_canonical.to_string_lossy().to_string());
-
-                        let mut payload = serde_json::to_value(FilePayload {
-                            path: path_canonical.to_string_lossy().to_string(),
-                            bytes: None,
-                        })
-                        .unwrap_or_else(|_| serde_json::json!({}));
-
-                        // Add relative path to payload
-                        if let Some(payload_obj) = payload.as_object_mut() {
-                            payload_obj.insert("rel_path".to_string(), serde_json::Value::String(rel_path));
-                        }
-
-                        let event = Event {
-                            id: Uuid::new_v4(),
-                            ts: OffsetDateTime::now_utc(),
-                            session_id: "pending".to_string(),
-                            event_type,
-                            payload,
-                            enforcement_action: false,
-                            attribution_reason: None,
-                            attribution_confidence: None,
-                            attribution_details_json: None,
-                        };
-
-                        if event_tx.send(event).is_err() {
-                            warn!("Event channel closed");
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("FS watcher error: {}", e);
-                }
-            }
-        })
-        .with_context(|| "Failed to create FS watcher")?;
+        let mut watcher = if self.options.use_poll_watcher {
+            let event_tx = self.event_tx.clone();
+            let root_clone = root_canonical.clone();
+            let heartbeat_tx = self.heartbeat_tx.clone();
+            let config = Config::default()
+                .with_poll_interval(Duration::from_millis(self.options.poll_interval_ms));
+            let w = PollWatcher::new(
+                move |res: Result<notify::Event, notify::Error>| {
+                    handle_fs_event(res, &event_tx, &root_clone, heartbeat_tx.as_ref());
+                },
+                config,
+            )
+                .with_context(|| "Failed to create PollWatcher")?;
+            WatcherImpl::Poll(w)
+        } else {
+            let event_tx = self.event_tx.clone();
+            let root_clone = root_canonical.clone();
+            let heartbeat_tx = self.heartbeat_tx.clone();
+            let w = notify::recommended_watcher(
+                move |res: Result<notify::Event, notify::Error>| {
+                    handle_fs_event(res, &event_tx, &root_clone, heartbeat_tx.as_ref());
+                },
+            )
+                .with_context(|| "Failed to create FS watcher")?;
+            WatcherImpl::Recommended(w)
+        };
 
         watcher.watch(&root_canonical, RecursiveMode::Recursive)
             .with_context(|| format!("Failed to watch root: {:?}", root_canonical))?;
-
         self.watchers.insert(root_canonical.clone(), watcher);
         info!("Successfully watching root: {:?}", root_canonical);
 
@@ -173,6 +191,91 @@ impl FsWatcherManager {
                 status: "running".to_string(),
             })
             .collect()
+    }
+}
+
+/// Shared logic for processing FS events from either watcher backend.
+fn handle_fs_event(
+    res: Result<notify::Event, notify::Error>,
+    event_tx: &mpsc::UnboundedSender<Event>,
+    root: &Path,
+    heartbeat_tx: Option<&mpsc::UnboundedSender<PathBuf>>,
+) {
+    match res {
+        Ok(event) => {
+            for (path_idx, path) in event.paths.iter().enumerate() {
+                let path_canonical = match path.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => path.clone(),
+                };
+
+                // Only emit for paths under our watched root (ignore e.g. Trash destination)
+                if !path_canonical.starts_with(root) {
+                    continue;
+                }
+
+                let event_type = match &event.kind {
+                    EventKind::Create(_) => EventType::FileCreate,
+                    EventKind::Modify(ref m) => {
+                        if let notify::event::ModifyKind::Name(rename_mode) = m {
+                            match rename_mode {
+                                RenameMode::From => EventType::FileDelete,
+                                RenameMode::To => EventType::FileCreate,
+                                RenameMode::Both => {
+                                    if path_idx == 0 {
+                                        EventType::FileDelete
+                                    } else {
+                                        EventType::FileCreate
+                                    }
+                                }
+                                _ => EventType::FileRename,
+                            }
+                        } else {
+                            EventType::FileWrite
+                        }
+                    }
+                    EventKind::Remove(_) => EventType::FileDelete,
+                    _ => continue,
+                };
+
+                let rel_path = path_canonical
+                    .strip_prefix(root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path_canonical.to_string_lossy().to_string());
+
+                let mut payload = serde_json::to_value(FilePayload {
+                    path: path_canonical.to_string_lossy().to_string(),
+                    bytes: None,
+                })
+                .unwrap_or_else(|_| serde_json::json!({}));
+
+                if let Some(payload_obj) = payload.as_object_mut() {
+                    payload_obj.insert("rel_path".to_string(), serde_json::Value::String(rel_path));
+                }
+
+                let ev = Event {
+                    id: Uuid::new_v4(),
+                    ts: OffsetDateTime::now_utc(),
+                    session_id: "pending".to_string(),
+                    event_type,
+                    payload,
+                    enforcement_action: false,
+                    attribution_reason: None,
+                    attribution_confidence: None,
+                    attribution_details_json: None,
+                };
+
+                if event_tx.send(ev).is_err() {
+                    warn!("Event channel closed");
+                }
+                if let Some(tx) = heartbeat_tx {
+                    let _ = tx.send(root.to_path_buf());
+                }
+            }
+        }
+        Err(e) => {
+            error!("FS watcher error: {}", e);
+        }
     }
 }
 

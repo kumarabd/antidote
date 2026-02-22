@@ -3,6 +3,7 @@ import { useDiagnostics } from "../app/hooks";
 import Card from "../components/Card";
 import Loading from "../components/Loading";
 import ErrorState from "../components/ErrorState";
+import { api } from "../app/api";
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -78,6 +79,16 @@ export default function Diagnostics() {
     loading,
     refresh,
   } = useDiagnostics();
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      await api.exportDiagnostics();
+    } finally {
+      setExporting(false);
+    }
+  };
 
   if (loading && !zeroConfig && !health && !confidence)
     return <Loading />;
@@ -86,7 +97,23 @@ export default function Diagnostics() {
 
   return (
     <div>
-      <h2 style={{ marginBottom: "1rem", fontSize: "1.5rem" }}>Diagnostics</h2>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem", flexWrap: "wrap", gap: "0.5rem" }}>
+        <h2 style={{ fontSize: "1.5rem", margin: 0 }}>Diagnostics</h2>
+        <button
+          onClick={handleExport}
+          disabled={exporting}
+          style={{
+            padding: "0.5rem 1rem",
+            background: "var(--accent)",
+            color: "white",
+            border: "none",
+            borderRadius: 4,
+            cursor: exporting ? "not-allowed" : "pointer",
+          }}
+        >
+          {exporting ? "Exporting…" : "Export Diagnostics"}
+        </button>
+      </div>
 
       {zeroConfig != null && (
         <JsonBlock title="Zero Config Status" data={zeroConfig} />

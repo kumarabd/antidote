@@ -151,6 +151,10 @@ impl SessionManager {
         if !self.should_watch(&name) {
             return None;
         }
+        // Only create sessions for main processes; helpers (Code Helper, Cursor Helper, etc.) would spawn many sessions
+        if !Self::is_main_process(&name) {
+            return None;
+        }
 
         // Check if we already have a session for this pid
         let pid_to_session = self.pid_to_session.read().await;
@@ -266,6 +270,17 @@ impl SessionManager {
             // Update observed_roots from state
             summary.observed_roots = s.observed_roots.iter().cloned().collect();
             summary
+        })
+    }
+
+    /// Get candidate and observed roots for a session (for UI display). Returns None if session not in manager.
+    pub async fn get_session_roots(&self, session_id: &str) -> Option<(Vec<String>, Vec<String>)> {
+        let sessions = self.sessions.read().await;
+        sessions.get(session_id).map(|s| {
+            (
+                s.candidate_roots.clone(),
+                s.observed_roots.iter().cloned().collect(),
+            )
         })
     }
 
@@ -409,6 +424,15 @@ impl SessionManager {
         }
 
         ended
+    }
+
+    /// Processes that get sessions: renderers for Cursor/VSCode (one per window), main for Claude.
+    fn is_main_process(name: &str) -> bool {
+        let n = name.to_lowercase();
+        n == "cursor helper (renderer)"
+            || n == "code helper (renderer)"
+            || n == "code - renderer"
+            || n == "claude"
     }
 
     fn should_watch(&self, name: &str) -> bool {

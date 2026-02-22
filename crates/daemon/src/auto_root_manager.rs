@@ -1,12 +1,12 @@
 //! Auto-root manager: consumes WorkspaceEvent, upserts roots as source=auto,
 //! reconciles stale/cap, and drives FSWatcherManager + watched_roots cache.
-//! Step 6: Uses RootPolicy for sanity checks; flap protection via min_presence_seconds.
+//! Event-driven: apply on sight with short debounce; handle RootsRemoved to disable.
 
 #[cfg(target_os = "macos")]
 use antidote_collectors::WorkspaceEvent;
 use antidote_storage::Storage;
 use crate::root_policy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -22,9 +22,8 @@ pub struct AutoRootConfig {
     pub enabled: bool,
     pub max_auto_roots: usize,
     pub stale_disable_days: u32,
+    /// Short debounce to coalesce rapid bursts (ms). Event-driven: apply on sight.
     pub apply_debounce_ms: u64,
-    /// Step 6: Min seconds a root must be observed before accepting (flap protection)
-    pub min_presence_seconds: u64,
 }
 
 impl Default for AutoRootConfig {
@@ -33,8 +32,7 @@ impl Default for AutoRootConfig {
             enabled: true,
             max_auto_roots: 20,
             stale_disable_days: 14,
-            apply_debounce_ms: 2000,
-            min_presence_seconds: 5,
+            apply_debounce_ms: 300,
         }
     }
 }
@@ -83,6 +81,9 @@ impl AutoRootManager {
             }
         }
 
+        if !roots.is_empty() {
+            info!("Auto-root manager applying {} roots: {:?}", roots.len(), roots);
+        }
         let cutoff = now - time::Duration::days(self.config.stale_disable_days as i64);
         let cutoff_str = cutoff
             .format(&Rfc3339)
@@ -108,6 +109,9 @@ impl AutoRootManager {
         }
 
         let enabled = self.storage.get_enabled_roots().await?;
+        if !enabled.is_empty() {
+            info!("FS watcher reconciled: {} roots enabled", enabled.len());
+        }
         {
             let mut watcher = self.fs_watcher.write().await;
             watcher.reconcile_watches(&enabled);
@@ -116,8 +120,7 @@ impl AutoRootManager {
         Ok(())
     }
 
-    /// Run the manager: consume WorkspaceEvent, debounce, apply and reconcile.
-    /// Step 6: Flap protection - only apply roots observed for min_presence_seconds.
+    /// Run the manager: consume WorkspaceEvent, debounce, apply on sight, handle RootsRemoved.
     #[cfg(target_os = "macos")]
     pub async fn run(
         self: Arc<Self>,
@@ -125,11 +128,12 @@ impl AutoRootManager {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         let debounce = Duration::from_millis(self.config.apply_debounce_ms);
-        let min_presence = Duration::from_secs(self.config.min_presence_seconds);
-        // path -> first_observed_ts
-        let mut pending_roots: HashMap<String, OffsetDateTime> = HashMap::new();
+        // Roots to apply (accumulated since last debounce)
+        let mut pending_roots: HashSet<String> = HashSet::new();
         let mut dirty = false;
         let mut debounce_deadline: Option<tokio::time::Instant> = None;
+        // Track which roots each (app, pid) contributes for RootsRemoved
+        let mut roots_by_app_pid: HashMap<(String, i32), HashSet<String>> = HashMap::new();
 
         loop {
             let sleep_fut = async {
@@ -143,17 +147,52 @@ impl AutoRootManager {
             tokio::select! {
                 ev = event_rx.recv() => {
                     match ev {
-                        Some(WorkspaceEvent::Updated { roots, .. }) => {
-                            let now = OffsetDateTime::now_utc();
-                            for r in roots {
-                                if let root_policy::RootDecision::Accept { normalized_root, .. } = root_policy::evaluate_root(&r) {
-                                    let n = normalized_root.to_string_lossy().to_string();
-                                    pending_roots.entry(n).or_insert(now);
-                                }
+                        Some(WorkspaceEvent::Updated { app, pid, roots, .. }) => {
+                            let key = (app.as_display_str().to_string(), pid);
+                            let accepted: HashSet<String> = roots
+                                .into_iter()
+                                .filter_map(|r| {
+                                    if let root_policy::RootDecision::Accept { normalized_root, .. } =
+                                        root_policy::evaluate_root(&r)
+                                    {
+                                        Some(normalized_root.to_string_lossy().to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            roots_by_app_pid.insert(key, accepted.clone());
+                            for n in &accepted {
+                                pending_roots.insert(n.clone());
                             }
                             dirty = true;
                             if debounce_deadline.is_none() {
                                 debounce_deadline = Some(tokio::time::Instant::now() + debounce);
+                            }
+                        }
+                        Some(WorkspaceEvent::RootsRemoved { app, pid, roots }) => {
+                            let key = (app.as_display_str().to_string(), pid);
+                            roots_by_app_pid.remove(&key);
+                            let still_referenced: HashSet<String> = roots_by_app_pid
+                                .values()
+                                .flat_map(|s| s.iter().cloned())
+                                .collect();
+                            for r in roots {
+                                if let root_policy::RootDecision::Accept { normalized_root, .. } =
+                                    root_policy::evaluate_root(&r)
+                                {
+                                    let n = normalized_root.to_string_lossy().to_string();
+                                    if !still_referenced.contains(&n) {
+                                        if let Err(e) = self.disable_auto_root_if_unreferenced(&n).await {
+                                            warn!("disable_auto_root {}: {}", n, e);
+                                        }
+                                    }
+                                }
+                            }
+                            let cutoff = OffsetDateTime::now_utc()
+                                - time::Duration::days(self.config.stale_disable_days as i64);
+                            if let Ok(s) = cutoff.format(&Rfc3339) {
+                                let _ = self.reconcile(&s.to_string()).await;
                             }
                         }
                         None => break,
@@ -166,39 +205,42 @@ impl AutoRootManager {
                 _ = sleep_fut => {
                     debounce_deadline = None;
                     if dirty {
-                        let now = OffsetDateTime::now_utc();
-                        let min_secs = min_presence.as_secs() as i64;
-                        let to_apply: Vec<String> = pending_roots
-                            .iter()
-                            .filter(|(_, first_ts)| (now - **first_ts).whole_seconds() >= min_secs)
-                            .map(|(p, _)| p.clone())
-                            .collect();
+                        let to_apply: Vec<String> = pending_roots.drain().collect();
                         if !to_apply.is_empty() {
                             if let Err(e) = self.apply_and_reconcile(to_apply).await {
                                 warn!("apply_and_reconcile: {}", e);
                             }
                         }
-                        pending_roots.retain(|_, first_ts| (now - *first_ts).whole_seconds() < min_secs * 2);
                         dirty = false;
                     }
                 }
             }
         }
     }
+
+    /// Disable an auto root if it exists and is not pinned.
+    async fn disable_auto_root_if_unreferenced(&self, path: &str) -> Result<(), anyhow::Error> {
+        if let Some(r) = self.storage.get_watched_root_by_path(path).await? {
+            if r.source == antidote_storage::RootSource::Auto && !r.pinned {
+                self.storage.set_watched_root_enabled(r.id, false).await?;
+                info!("Auto root disabled (no longer referenced): {}", path);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::root_policy;
     use std::path::Path;
 
     #[test]
-    fn normalize_root_path_expands_tilde() {
+    fn normalize_path_expands_tilde() {
         if std::env::var_os("HOME").is_some() {
-            let n = normalize_root_path("~/foo");
+            let n = root_policy::normalize_path("~/foo");
             assert!(n.is_some());
-            assert!(n.unwrap().contains("foo"));
+            assert!(n.unwrap().to_string_lossy().contains("foo"));
         }
     }
 
@@ -218,12 +260,15 @@ mod tests {
     #[test]
     fn root_policy_rejects_home() {
         if let Some(home) = std::env::var_os("HOME") {
-            let home_str = home.to_string_lossy();
+            let home_str = home.to_string_lossy().to_string();
             let decision = root_policy::evaluate_root(&home_str);
             match decision {
                 root_policy::RootDecision::Reject { .. } => {}
                 root_policy::RootDecision::Accept { .. } => {
-                    assert!(Path::new(&home_str).join(".git").exists() || Path::new(&home_str).join("Cargo.toml").exists());
+                    assert!(
+                        Path::new(&home_str).join(".git").exists()
+                            || Path::new(&home_str).join("Cargo.toml").exists()
+                    );
                 }
             }
         }

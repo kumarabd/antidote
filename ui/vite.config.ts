@@ -7,9 +7,12 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/ui/state": { target: "http://127.0.0.1:17845", changeOrigin: true },
-      "/ui/sessions": { target: "http://127.0.0.1:17845", changeOrigin: true },
+      "/ui": { target: "http://127.0.0.1:17845", changeOrigin: true },
+      "/support": { target: "http://127.0.0.1:17845", changeOrigin: true },
       "/debug": { target: "http://127.0.0.1:17845", changeOrigin: true },
+      "/health": { target: "http://127.0.0.1:17845", changeOrigin: true },
+      "/sessions": { target: "http://127.0.0.1:17845", changeOrigin: true },
+      "/roots": { target: "http://127.0.0.1:17845", changeOrigin: true },
     },
   },
 });

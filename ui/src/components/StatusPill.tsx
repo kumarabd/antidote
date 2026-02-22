@@ -1,12 +1,20 @@
-import type { TrustStatus } from "../app/types";
+import type { TrustStatus, ConfidenceLevel, HealthStatus } from "../app/types";
+
+type Status = TrustStatus | ConfidenceLevel | HealthStatus;
 
 const styles: Record<string, React.CSSProperties> = {
   Trusted: { background: "var(--success)", color: "#fff" },
   NeedsReview: { background: "var(--warning)", color: "#000" },
   Risky: { background: "var(--danger)", color: "#fff" },
+  High: { background: "var(--success)", color: "#fff" },
+  Medium: { background: "var(--warning)", color: "#000" },
+  Low: { background: "var(--danger)", color: "#fff" },
+  Healthy: { background: "var(--success)", color: "#fff" },
+  Degraded: { background: "var(--warning)", color: "#000" },
+  Unhealthy: { background: "var(--danger)", color: "#fff" },
 };
 
-export default function StatusPill({ status }: { status: TrustStatus }) {
+export default function StatusPill({ status }: { status: Status }) {
   return (
     <span
       style={{

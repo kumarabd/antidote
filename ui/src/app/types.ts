@@ -55,10 +55,24 @@ export interface DomainContact {
   egress_bytes: number;
 }
 
+export interface RecentEventDetails {
+  path?: string;
+  rel_path?: string;
+  domain?: string;
+  bytes?: number;
+  bytes_in?: number;
+  bytes_out?: number;
+  argv?: string[];
+  name?: string;
+  pid?: number;
+}
+
 export interface RecentEvent {
   ts: string;
-  kind: "fs" | "net" | "cmd" | "flag";
+  event_type: string;
+  kind: string;
   summary: string;
+  details?: RecentEventDetails;
   attribution_reason?: string;
   confidence?: string;
 }
@@ -74,6 +88,8 @@ export interface UISessionResponse {
     duration_seconds?: number;
     summary_json?: Record<string, unknown>;
   };
+  candidate_roots: string[];
+  observed_roots: string[];
   top_findings: TopFinding[];
   touched_files: TouchedFile[];
   domains: DomainContact[];

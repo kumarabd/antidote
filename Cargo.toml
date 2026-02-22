@@ -63,3 +63,12 @@ futures = "0.3"
 # Reliable signal handling (when tokio's ctrl_c doesn't work, e.g. under cargo run on macOS)
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
+
+# ZIP creation for diagnostics export
+zip = "2.2"
+
+# System info for diagnostics
+hostname = "0.3"
+
+# Unix process checks (orphan session finalization)
+libc = "0.2"

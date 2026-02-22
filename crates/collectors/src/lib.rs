@@ -5,22 +5,29 @@ mod proxy;
 #[cfg(target_os = "macos")]
 mod app_detector_macos;
 #[cfg(target_os = "macos")]
+mod nsworkspace_observer_macos;
+#[cfg(target_os = "macos")]
 mod audit_macos;
 #[cfg(target_os = "macos")]
 mod workspace_resolver_macos;
 #[cfg(target_os = "macos")]
 mod foreground_macos;
 
-pub use fs_watcher::{FsWatcherManager, WatcherStatus};
+pub use fs_watcher::{FsWatcherManager, FsWatcherOptions, WatcherStatus};
 pub use proxy::ProxyServer;
 #[cfg(target_os = "macos")]
-pub use app_detector_macos::{AppDetectorState, AppEvent, AppInstance, AppKind, AppDetector, MacAppDetector, DEFAULT_POLL_INTERVAL_MS};
+pub use app_detector_macos::{
+    AppDetector, AppDetectorState, AppEvent, AppInstance, AppKind, MacAppDetector,
+    DEFAULT_POLL_INTERVAL_MS,
+};
+#[cfg(target_os = "macos")]
+pub use nsworkspace_observer_macos::{spawn_foreground_activate_observer, spawn_nsworkspace_observer};
 #[cfg(target_os = "macos")]
 pub use audit_macos::AuditCollector;
 #[cfg(target_os = "macos")]
 pub use workspace_resolver_macos::{
-    Confidence, SourceTier, WorkspaceEvent, WorkspaceResolver, WorkspaceResolverConfig,
-    WorkspaceResolverState, WorkspaceState,
+    spawn_storage_watcher, Confidence, SourceTier, WorkspaceEvent, WorkspaceResolver,
+    WorkspaceResolverConfig, WorkspaceResolverState, WorkspaceState,
 };
 #[cfg(target_os = "macos")]
 pub use foreground_macos::{ForegroundApp, ForegroundPoller, app_kind_from_name};
@@ -87,7 +94,7 @@ impl ProcessPoller {
                 let exe = process.exe().and_then(|p| p.to_str().map(|s| s.to_string()));
 
                 // Check if we should watch this process
-                if self.should_watch(&name, ppid) {
+                if self.should_watch(&name, ppid) && Self::is_main_process(&name) {
                     if !self.seen_pids.contains_key(&pid_val) {
                         // New process - emit ProcStart
                         let info = ProcessInfo {
@@ -174,6 +181,18 @@ impl ProcessPoller {
                 }
             }
         }
+    }
+
+    /// Processes that get sessions: renderers for Cursor/VSCode (one per window), main for Claude.
+    /// We skip Cursor/Code main process to avoid duplicate sessions (main + N renderers).
+    fn is_main_process(name: &str) -> bool {
+        let n = name.to_lowercase();
+        // Cursor/VSCode: only renderers (one session per window)
+        n == "cursor helper (renderer)"
+            || n == "code helper (renderer)"
+            || n == "code - renderer"
+            // Claude: main process (no multi-window renderer model)
+            || n == "claude"
     }
 
     /// Determine if we should watch a process

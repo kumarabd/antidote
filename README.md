@@ -85,6 +85,37 @@ See [docs/TESTING.md](docs/TESTING.md) for full details.
 
 ---
 
+## Diagnostics export
+
+To export a diagnostics bundle for support:
+
+**UI:** Click "Export Diagnostics" on the Dashboard or Diagnostics page. A zip file will download.
+
+**curl:**
+```bash
+curl -X POST "http://127.0.0.1:17845/support/diagnostics/export?include_logs=true&include_config=true" -o antidote-diagnostics.zip
+```
+
+The zip contains: status snapshot, health, confidence, warnings, pipeline stats, recent sessions, system info, and optionally config (redacted) and logs.
+
+---
+
+## Retention
+
+By default:
+- Raw events older than **7 days** are pruned
+- Session summaries are kept for **90 days**
+- Retention runs every **60 minutes**
+- Run `GET /debug/retention` to inspect status
+
+---
+
+## Logging
+
+The daemon logs to stdout. Set `RUST_LOG=antidote=info` (or `debug`) to control verbosity. If a log file is configured (e.g. `antidote.log` in the working directory), `GET /debug/log_tail?lines=200` returns the last N lines.
+
+---
+
 ## Privacy and safety
 
 - **No file contents** – Only paths, sizes, and timestamps are recorded.

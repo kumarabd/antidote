@@ -1,5 +1,7 @@
 //! HTTP API for Antidote
 
+mod diagnostics_export;
+
 use antidote_core::{
     attribute_event, AttributionContext, AttributionResult, Event, EventType, EnforcementConfig,
     Flag, ForegroundContext, SafeModeConfig, SessionSummary,
@@ -58,6 +60,8 @@ pub struct ApiState {
     pub telemetry_integrity: Option<Arc<dyn antidote_core::TelemetryIntegrityProvider>>,
     /// Path to built UI dist (ui/dist). If set and exists, SPA is served from here.
     pub ui_dist: Option<PathBuf>,
+    /// Pipeline event sender: when set, debug/emit sends events through pipeline (attribution, rules) instead of direct insert.
+    pub pipeline_tx: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
 }
 
 /// Health check response
@@ -115,6 +119,7 @@ pub fn create_router(
     drop_metrics: Option<Arc<dyn antidote_core::DropMetrics>>,
     attribution_debug: Option<Arc<dyn antidote_core::AttributionDebugProvider>>,
     telemetry_integrity: Option<Arc<dyn antidote_core::TelemetryIntegrityProvider>>,
+    pipeline_tx: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
 ) -> Router {
     let state = ApiState {
         storage,
@@ -134,6 +139,7 @@ pub fn create_router(
         attribution_debug,
         telemetry_integrity,
         ui_dist: default_ui_dist(),
+        pipeline_tx,
     };
     create_router_routes(state)
 }
@@ -153,6 +159,7 @@ pub fn create_router(
     drop_metrics: Option<Arc<dyn antidote_core::DropMetrics>>,
     attribution_debug: Option<Arc<dyn antidote_core::AttributionDebugProvider>>,
     telemetry_integrity: Option<Arc<dyn antidote_core::TelemetryIntegrityProvider>>,
+    pipeline_tx: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
 ) -> Router {
     let state = ApiState {
         storage,
@@ -168,6 +175,7 @@ pub fn create_router(
         attribution_debug,
         telemetry_integrity,
         ui_dist: default_ui_dist(),
+        pipeline_tx,
     };
     create_router_routes(state)
 }
@@ -210,6 +218,9 @@ fn create_router_routes(state: ApiState) -> Router {
         .route("/debug/focus", post(set_focus_handler))
         .route("/debug/db", get(db_health_handler))
         .route("/debug/prune", post(prune_handler))
+        .route("/debug/log_tail", get(debug_log_tail_handler))
+        .route("/debug/retention", get(debug_retention_handler))
+        .route("/support/diagnostics/export", post(diagnostics_export::diagnostics_export_handler))
         .route("/capabilities", get(capabilities_handler))
         .route("/ui/state", get(ui_state_handler))
         .route("/ui/sessions/:id", get(ui_session_handler))
@@ -267,6 +278,9 @@ fn create_router_routes(state: ApiState) -> Router {
         .route("/debug/focus", post(set_focus_handler))
         .route("/debug/db", get(db_health_handler))
         .route("/debug/prune", post(prune_handler))
+        .route("/debug/log_tail", get(debug_log_tail_handler))
+        .route("/debug/retention", get(debug_retention_handler))
+        .route("/support/diagnostics/export", post(diagnostics_export::diagnostics_export_handler))
         .route("/debug/attribution/simulate", get(debug_attribution_simulate_handler))
         .route("/debug/attribution/state", get(debug_attribution_state_handler))
         .route("/capabilities", get(capabilities_handler))
@@ -472,6 +486,45 @@ async fn debug_pipeline_handler(
     };
     let snapshot = provider.clone().get_pipeline().await;
     Ok(Json(snapshot))
+}
+
+#[derive(Deserialize)]
+struct LogTailParams {
+    lines: Option<u32>,
+}
+
+async fn debug_log_tail_handler(
+    Query(params): Query<LogTailParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let lines = params.lines.unwrap_or(200).min(2000);
+    let candidates = ["antidote.log", "daemon.log", "/tmp/antidote.log"];
+    for path in &candidates {
+        if let Ok(content) = tokio::fs::read_to_string(path).await {
+            let line_list: Vec<&str> = content.lines().collect();
+            let start = line_list.len().saturating_sub(lines as usize);
+            let tail = line_list[start..].join("\n");
+            return Ok(Json(serde_json::json!({
+                "path": path,
+                "lines": tail.lines().count(),
+                "content": tail,
+            })));
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "message": "No log file configured; using stdout only.",
+        "path": null,
+        "lines": 0,
+    })))
+}
+
+async fn debug_retention_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "events_days": 7,
+        "sessions_days": 90,
+        "run_every_minutes": 60,
+        "last_run_ts": null,
+        "deleted_counts": {},
+    }))
 }
 
 #[derive(Serialize)]
@@ -723,12 +776,38 @@ struct UIDomainContact {
 #[derive(Serialize)]
 struct UIRecentEvent {
     ts: String,
+    event_type: String,
     kind: String,
     summary: String,
+    /// Extra details (path, domain, bytes, argv, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<UIRecentEventDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attribution_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UIRecentEventDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rel_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_out: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -741,6 +820,8 @@ struct UISessionDiagnostics {
 #[derive(Serialize)]
 struct UISessionResponse {
     session: UISessionRow,
+    candidate_roots: Vec<String>,
+    observed_roots: Vec<String>,
     top_findings: Vec<UITopFinding>,
     touched_files: Vec<UITouchedFile>,
     domains: Vec<UIDomainContact>,
@@ -762,7 +843,16 @@ async fn ui_state_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let active_sessions: Vec<SessionSummary> = if let Some(ref mgr) = state.session_manager {
-        mgr.get_active_sessions().await
+        let from_mgr = mgr.get_active_sessions().await;
+        let mgr_ids: std::collections::HashSet<_> = from_mgr.iter().map(|s| s.session_id.as_str()).collect();
+        let db_active: Vec<_> = all_sessions
+            .iter()
+            .filter(|s| s.end_ts.is_none() && !mgr_ids.contains(s.session_id.as_str()))
+            .cloned()
+            .collect();
+        let mut merged = from_mgr;
+        merged.extend(db_active);
+        merged
     } else {
         all_sessions
             .iter()
@@ -788,7 +878,7 @@ async fn ui_state_handler(
     let health = if fs_active { "Healthy" } else { "Degraded" };
     let confidence = if fs_active { "High" } else { "Medium" };
     let reasons: Vec<String> = if !fs_active {
-        vec!["fs_watcher_inactive".to_string()]
+        vec!["No watched roots — add a path via Roots API or open a project in Cursor".to_string()]
     } else {
         vec![]
     };
@@ -973,37 +1063,188 @@ async fn ui_session_handler(
                 | EventType::FileDelete | EventType::FileRename => "fs",
                 EventType::NetHttp | EventType::NetConnect => "net",
                 EventType::CmdExec | EventType::ProcSpawn => "cmd",
-                _ => "flag",
+                EventType::ProcStart | EventType::ProcExit => "proc",
+                EventType::Heartbeat | EventType::Tick => "sys",
             };
-            let summary = e
-                .payload
-                .get("path")
-                .or(e.payload.get("domain"))
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| format!("{:?}", e.event_type));
+            let event_type_str = format!("{:?}", e.event_type);
+
+            let (summary, details) = match e.event_type {
+                EventType::FileWrite | EventType::FileCreate | EventType::FileDelete
+                | EventType::FileRename | EventType::FileRead => {
+                    let path = e.payload.get("path").and_then(|v| v.as_str()).map(String::from);
+                    let rel_path = e.payload.get("rel_path").and_then(|v| v.as_str()).map(String::from);
+                    let bytes = e.payload.get("bytes").and_then(|v| v.as_u64());
+                    let op = match e.event_type {
+                        EventType::FileWrite => "write",
+                        EventType::FileCreate => "create",
+                        EventType::FileDelete => "delete",
+                        EventType::FileRename => "rename",
+                        EventType::FileRead => "read",
+                        _ => "fs",
+                    };
+                    let path_display = path.as_deref().unwrap_or("?");
+                    let summary = format!("{} {} {}", op, path_display, bytes.map(|b| format!("({} B)", b)).unwrap_or_default()).trim_end().to_string();
+                    let details = Some(UIRecentEventDetails {
+                        path,
+                        rel_path,
+                        domain: None,
+                        bytes,
+                        bytes_in: None,
+                        bytes_out: None,
+                        argv: None,
+                        name: None,
+                        pid: None,
+                    });
+                    (summary, details)
+                }
+                EventType::NetHttp | EventType::NetConnect => {
+                    let domain = e.payload.get("domain").and_then(|v| v.as_str()).map(String::from);
+                    let bytes_in = e.payload.get("bytes_in").and_then(|v| v.as_u64());
+                    let bytes_out = e.payload.get("bytes").or(e.payload.get("bytes_out")).and_then(|v| v.as_u64());
+                    let summary = if let Some(ref d) = domain {
+                        let size = bytes_out.or(bytes_in).map(|b| format!(" {}B", b)).unwrap_or_default();
+                        format!("{} {}{}", if e.event_type == EventType::NetConnect { "connect" } else { "http" }, d, size)
+                    } else {
+                        format!("{:?}", e.event_type)
+                    };
+                    let details = Some(UIRecentEventDetails {
+                        path: None,
+                        rel_path: None,
+                        domain,
+                        bytes: bytes_out.or(bytes_in),
+                        bytes_in,
+                        bytes_out,
+                        argv: None,
+                        name: None,
+                        pid: None,
+                    });
+                    (summary, details)
+                }
+                EventType::CmdExec | EventType::ProcSpawn => {
+                    let argv = e.payload.get("argv").and_then(|v| {
+                        v.as_array().map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                    let name = e.payload.get("name").and_then(|v| v.as_str()).map(String::from);
+                    let pid = e.payload.get("pid").and_then(|v| v.as_i64()).map(|p| p as i32);
+                    let summary = argv.as_ref()
+                        .filter(|a| !a.is_empty())
+                        .map(|a| a.join(" "))
+                        .or_else(|| name.clone())
+                        .unwrap_or_else(|| format!("{:?}", e.event_type));
+                    let details = Some(UIRecentEventDetails {
+                        path: None,
+                        rel_path: None,
+                        domain: None,
+                        bytes: None,
+                        bytes_in: None,
+                        bytes_out: None,
+                        argv,
+                        name,
+                        pid,
+                    });
+                    (summary, details)
+                }
+                EventType::ProcStart | EventType::ProcExit => {
+                    let name = e.payload.get("name").and_then(|v| v.as_str()).map(String::from);
+                    let pid = e.payload.get("pid").and_then(|v| v.as_i64()).map(|p| p as i32);
+                    let summary = format!("{} {} (pid={})",
+                        if e.event_type == EventType::ProcStart { "start" } else { "exit" },
+                        name.as_deref().unwrap_or("?"),
+                        pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()));
+                    let details = Some(UIRecentEventDetails {
+                        path: None,
+                        rel_path: None,
+                        domain: None,
+                        bytes: None,
+                        bytes_in: None,
+                        bytes_out: None,
+                        argv: None,
+                        name,
+                        pid,
+                    });
+                    (summary, details)
+                }
+                _ => {
+                    let fallback = e.payload.get("path").or(e.payload.get("domain"))
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| format!("{:?}", e.event_type));
+                    (fallback, None)
+                }
+            };
+
             UIRecentEvent {
                 ts: e.ts.to_string(),
+                event_type: event_type_str,
                 kind: kind.to_string(),
                 summary,
+                details,
                 attribution_reason: e.attribution_reason.clone(),
                 confidence: e.attribution_confidence.map(|c| format!("{}", c)),
             }
         })
         .collect();
 
-    let (tel_conf, attr_qual, root_cov) = match &state.telemetry_integrity {
-        Some(p) => {
-            let aq = p.clone().get_attribution_quality().await;
-            let rc = p.clone().get_root_coverage().await;
-            let tc = aq.get("quality_score").and_then(|x| x.as_f64()).unwrap_or(1.0);
-            let rc_val = rc.get("root_coverage_ratio").and_then(|x| x.as_f64()).unwrap_or(1.0);
-            ("High".to_string(), tc, rc_val)
+    // Per-session diagnostics from actual session + events data
+    let tel_conf = match session.telemetry_confidence {
+        antidote_core::TelemetryConfidence::High => "High",
+        antidote_core::TelemetryConfidence::Med => "Medium",
+        antidote_core::TelemetryConfidence::Low => "Low",
+    }
+    .to_string();
+
+    let mut attr_sum: u64 = 0;
+    let mut attr_count: u64 = 0;
+    let mut file_events_total: u64 = 0;
+    let mut file_events_under_root: u64 = 0;
+    for e in &events {
+        if let Some(c) = e.attribution_confidence {
+            attr_sum += c as u64;
+            attr_count += 1;
         }
-        None => ("Medium".to_string(), 1.0, 1.0),
+        if matches!(
+            e.event_type,
+            EventType::FileRead | EventType::FileWrite | EventType::FileCreate
+                | EventType::FileDelete | EventType::FileRename
+        ) {
+            file_events_total += 1;
+            if let Some(path) = e.payload.get("path").and_then(|v| v.as_str()) {
+                if session.observed_roots.iter().any(|r| path.starts_with(r.as_str())) {
+                    file_events_under_root += 1;
+                }
+            }
+        }
+    }
+    let attr_qual = if attr_count > 0 {
+        attr_sum as f64 / attr_count as f64 / 100.0
+    } else {
+        1.0
+    };
+    let root_cov = if file_events_total > 0 {
+        file_events_under_root as f64 / file_events_total as f64
+    } else {
+        1.0
+    };
+
+    let (candidate_roots, observed_roots) = if session.end_ts.is_none() {
+        if let Some(ref mgr) = state.session_manager {
+            mgr.get_session_roots(&session_id)
+                .await
+                .unwrap_or_else(|| (vec![], session.observed_roots.clone()))
+        } else {
+            (vec![], session.observed_roots.clone())
+        }
+    } else {
+        (vec![], session.observed_roots.clone())
     };
 
     Ok(Json(UISessionResponse {
         session: session_row,
+        candidate_roots,
+        observed_roots,
         top_findings,
         touched_files,
         domains,
@@ -1626,9 +1867,21 @@ async fn emit_event_handler(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let event = Event::new(req.session_id, event_type, req.payload);
+    if let Some(ref tx) = state.pipeline_tx {
+        // Send through pipeline: attribution, rules, persist. Use "pending" so attribution runs.
+        let mut event = Event::new("pending".to_string(), event_type, req.payload);
+        // Preserve session_id for ProcStart/ProcExit if caller specified one
+        if matches!(event_type, EventType::ProcStart | EventType::ProcExit) && req.session_id != "pending" {
+            event.session_id = req.session_id;
+        }
+        if tx.send(event).is_err() {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        return Ok(Json(EmitEventResponse { accepted: true }));
+    }
 
-    // Store the event
+    // Fallback: direct insert (no attribution, no rules) when API runs without daemon pipeline
+    let event = Event::new(req.session_id, event_type, req.payload);
     state
         .storage
         .insert_event(&event)
@@ -1679,6 +1932,13 @@ async fn add_root_handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Reconcile FS watcher so the new root is actually watched
+    if let Some(ref w) = state.fs_watcher {
+        if let Ok(enabled) = state.storage.get_enabled_roots().await {
+            w.write().await.reconcile_watches(&enabled);
+        }
+    }
+
     // Fetch the created root
     let roots = state
         .storage
@@ -1703,6 +1963,12 @@ async fn delete_root_handler(
         .delete_watched_root(id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(ref w) = state.fs_watcher {
+        if let Ok(enabled) = state.storage.get_enabled_roots().await {
+            w.write().await.reconcile_watches(&enabled);
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1716,6 +1982,12 @@ async fn enable_root_handler(
         .set_watched_root_enabled(id, req.enabled)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(ref w) = state.fs_watcher {
+        if let Ok(enabled) = state.storage.get_enabled_roots().await {
+            w.write().await.reconcile_watches(&enabled);
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

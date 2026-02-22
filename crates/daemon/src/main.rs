@@ -11,14 +11,16 @@ mod pipeline;
 mod rate_limiter;
 mod root_policy;
 mod session_lifecycle;
+// mod watcher_supervisor; // P0: wired when watcher supervisor integrated with API
 
 use antidote_api::create_router;
 use antidote_behavior;
-use antidote_collectors::{FsWatcherManager, ProcessPoller, ProxyServer};
+use antidote_collectors::{FsWatcherManager, FsWatcherOptions, ProcessPoller, ProxyServer};
 #[cfg(target_os = "macos")]
 use antidote_collectors::{
     AppDetectorState, AppEvent, AppDetector, ForegroundPoller, MacAppDetector,
-    WorkspaceResolver, WorkspaceResolverConfig, WorkspaceResolverState,
+    spawn_foreground_activate_observer, WorkspaceResolver, WorkspaceResolverConfig,
+    WorkspaceResolverState,
 };
 use antidote_core::{
     Event, EventType, Flag, Label, SessionSummary, Severity,
@@ -111,7 +113,7 @@ impl Default for AppDetectorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_ms: 2000,
+            poll_interval_ms: 60_000, // 60s reconciliation; NSWorkspace observer provides event-driven launch/terminate
         }
     }
 }
@@ -130,7 +132,7 @@ impl Default for WorkspaceResolverConfigDaemon {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_ms: 5000,
+            poll_interval_ms: 30_000, // 30s fallback; FSEvents on storage dirs provides event-driven wake
             max_roots_per_app: 5,
             dev_dir_candidates: vec![
                 "~/code".to_string(),
@@ -150,13 +152,12 @@ struct AutoRootConfigDaemon {
     enabled: bool,
     max_auto_roots: usize,
     stale_disable_days: u32,
+    #[serde(default = "default_apply_debounce_ms")]
     apply_debounce_ms: u64,
-    #[serde(default = "default_min_presence_seconds")]
-    min_presence_seconds: u64,
 }
 
-fn default_min_presence_seconds() -> u64 {
-    5
+fn default_apply_debounce_ms() -> u64 {
+    300
 }
 
 impl Default for AutoRootConfigDaemon {
@@ -165,8 +166,7 @@ impl Default for AutoRootConfigDaemon {
             enabled: true,
             max_auto_roots: 20,
             stale_disable_days: 14,
-            apply_debounce_ms: 2000,
-            min_presence_seconds: 5,
+            apply_debounce_ms: 300,
         }
     }
 }
@@ -175,16 +175,28 @@ impl Default for AutoRootConfigDaemon {
 struct FileEventsConfig {
     #[serde(default = "default_coalesce_window_ms")]
     coalesce_window_ms: u64,
+    /// Use PollWatcher instead of FSEvents (fallback). Fixes missed events for "unowned" paths on macOS (e.g. /tmp).
+    #[serde(default)]
+    use_poll_watcher: Option<bool>,
+    /// Poll interval in ms when use_poll_watcher is enabled. Default 1000.
+    #[serde(default = "default_poll_interval_ms")]
+    poll_interval_ms: u64,
 }
 
 fn default_coalesce_window_ms() -> u64 {
     800
 }
 
+fn default_poll_interval_ms() -> u64 {
+    1000
+}
+
 impl Default for FileEventsConfig {
     fn default() -> Self {
         Self {
             coalesce_window_ms: 800,
+            use_poll_watcher: None,
+            poll_interval_ms: 1000,
         }
     }
 }
@@ -221,6 +233,25 @@ impl Default for AttributionConfig {
     fn default() -> Self {
         Self {
             recent_session_window_seconds: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PipelineConfig {
+    /// Tick interval for aggregate rule evaluation (Phase 3: 10s per design).
+    #[serde(default = "default_tick_interval_secs")]
+    tick_interval_secs: u64,
+}
+
+fn default_tick_interval_secs() -> u64 {
+    10
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval_secs: 10,
         }
     }
 }
@@ -263,6 +294,8 @@ struct Config {
     #[serde(default)]
     file_events: FileEventsConfig,
     #[serde(default)]
+    pipeline: PipelineConfig, // Phase 3: tick_interval_secs for aggregate rules
+    #[serde(default)]
     limits: LimitsConfig,
     #[serde(default)]
     focus: FocusConfig,
@@ -298,6 +331,7 @@ impl Default for Config {
             workspace_resolver: WorkspaceResolverConfigDaemon::default(),
             auto_roots: AutoRootConfigDaemon::default(),
             file_events: FileEventsConfig::default(),
+            pipeline: PipelineConfig::default(),
             limits: LimitsConfig::default(),
             focus: FocusConfig::default(),
             attribution: AttributionConfig::default(),
@@ -438,7 +472,35 @@ async fn run_emergency_freeze(
     info!("Emergency freeze completed: {} sessions force-terminated", session_ids.len());
 }
 
-/// Wait for process termination signal (Ctrl+C or SIGTERM).
+/// A3: Finalize orphan sessions (ended_at NULL but pid no longer running).
+async fn finalize_orphan_sessions(
+    storage: &Storage,
+    baseline_cache: &Arc<RwLock<HashMap<String, antidote_behavior::AppBaseline>>>,
+) {
+    let sessions = storage.list_sessions(Some(500), None, None, None).await;
+    let Ok(sessions) = sessions else { return };
+    let now = time::OffsetDateTime::now_utc();
+    for s in sessions {
+        if s.end_ts.is_some() {
+            continue;
+        }
+        if s.root_pid == 0 {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            let running = unsafe { libc::kill(s.root_pid, 0) == 0 };
+            if !running {
+                if let Ok(summary) = storage.finalize_session(&s.session_id, now).await {
+                    process_finalized_session(storage, baseline_cache, summary).await;
+                    info!("Finalized orphan session {} (pid {} not running)", s.session_id, s.root_pid);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = s;
+    }
+}
 /// Uses signal-hook-tokio on Unix (reliable under cargo run / subprocess); ctrl_c on Windows.
 async fn wait_for_shutdown_signal() -> Result<(), anyhow::Error> {
     #[cfg(unix)]
@@ -478,6 +540,14 @@ async fn main() -> Result<()> {
         config.db_url, config.listen_addr, config.rules_path, config.watch_processes
     );
 
+    // A3: DB resilience - check integrity before init, recover if corrupt
+    let db_recovered = antidote_storage::try_recover_db(&config.db_url)
+        .await
+        .context("DB recovery failed")?;
+    if db_recovered {
+        warn!("DB was corrupt and recovered; old file moved to .corrupt.<ts>");
+    }
+
     // Initialize storage
     let storage = Arc::new(
         Storage::init(&config.db_url)
@@ -512,6 +582,9 @@ async fn main() -> Result<()> {
         }
         info!("Loaded {} app baselines", baseline_cache.read().await.len());
     }
+
+    // A3: Orphan session finalization
+    finalize_orphan_sessions(&storage, &baseline_cache).await;
 
     // Load rule engine
     let rule_engine = Arc::new(
@@ -555,7 +628,13 @@ async fn main() -> Result<()> {
     }
 
     // Initialize FS watcher manager (sends to raw_tx; coalescer filters and forwards to pipeline)
-    let fs_watcher = Arc::new(RwLock::new(FsWatcherManager::new(raw_tx.clone())));
+    // Default: FSEvents (native). Set file_events.use_poll_watcher: true for PollWatcher fallback (e.g. /tmp, unowned paths).
+    let use_poll = config.file_events.use_poll_watcher.unwrap_or(false);
+    let fs_opts = FsWatcherOptions {
+        use_poll_watcher: use_poll,
+        poll_interval_ms: config.file_events.poll_interval_ms,
+    };
+    let fs_watcher = Arc::new(RwLock::new(FsWatcherManager::new_with_options(raw_tx.clone(), fs_opts)));
     
     // Load and start watching enabled roots; shared cache for pipeline and AutoRootManager
     let enabled_roots = storage.get_enabled_roots().await
@@ -604,7 +683,10 @@ async fn main() -> Result<()> {
             let state = Arc::new(RwLock::new(AppDetectorState::default()));
             let (app_event_tx, mut app_event_rx) = mpsc::channel::<AppEvent>(64);
             let detector = MacAppDetector::new(config.app_detector.poll_interval_ms);
-            let mut detector_handle = detector.start(app_event_tx);
+            let mut detector_handle = detector.start(app_event_tx.clone());
+            let shutdown_rx_ns = shutdown_tx.subscribe();
+            let _nsworkspace_handle =
+                antidote_collectors::spawn_nsworkspace_observer(app_event_tx, shutdown_rx_ns);
             let consumer_state = state.clone();
             let consumer_lifecycle = app_detector_lifecycle.clone().unwrap();
             let consumer_handle = tokio::spawn(async move {
@@ -612,7 +694,7 @@ async fn main() -> Result<()> {
                 while let Some(ev) = app_event_rx.recv().await {
                     consumer_lifecycle.handle_app_event(ev.clone()).await;
                     match ev {
-                        AppEvent::Started { app, pid, bundle_id, started_at } => {
+                        AppEvent::Started { app, pid, process_name: _, bundle_id, started_at } => {
                             info!("App started: {} pid={}", app.as_display_str(), pid);
                             let instance = antidote_collectors::AppInstance::new(app, pid, bundle_id, started_at);
                             by_pid.insert(pid, instance);
@@ -647,7 +729,7 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let app_detector_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Workspace resolver (macOS only): infers workspace roots; optional channel for AutoRootManager
+    // Workspace resolver (macOS only): infers workspace roots; event-driven via storage FSEvents
     #[cfg(target_os = "macos")]
     let (workspace_resolver_state, workspace_resolver_handle, workspace_event_rx) = {
         if !config.workspace_resolver.enabled || app_detector_state.is_none() {
@@ -655,6 +737,10 @@ async fn main() -> Result<()> {
         } else {
             let state = Arc::new(RwLock::new(WorkspaceResolverState::default()));
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<antidote_collectors::WorkspaceEvent>();
+            let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let shutdown_rx_watcher = shutdown_tx.subscribe();
+            let _storage_watcher_handle =
+                antidote_collectors::spawn_storage_watcher(wake_tx, shutdown_rx_watcher);
             let resolver_config = WorkspaceResolverConfig {
                 poll_interval_ms: config.workspace_resolver.poll_interval_ms,
                 max_roots_per_app: config.workspace_resolver.max_roots_per_app,
@@ -666,7 +752,7 @@ async fn main() -> Result<()> {
             let app_state = app_detector_state.clone().unwrap();
             let shutdown_rx_ws = shutdown_tx.subscribe();
             let handle = tokio::spawn(async move {
-                resolver.run(app_state, shutdown_rx_ws).await;
+                resolver.run(app_state, shutdown_rx_ws, wake_rx).await;
             });
             (Some(state), Some(handle), Some(event_rx))
         }
@@ -685,7 +771,6 @@ async fn main() -> Result<()> {
                     max_auto_roots: config.auto_roots.max_auto_roots,
                     stale_disable_days: config.auto_roots.stale_disable_days,
                     apply_debounce_ms: config.auto_roots.apply_debounce_ms,
-                    min_presence_seconds: config.auto_roots.min_presence_seconds,
                 },
                 storage.clone(),
                 fs_watcher.clone(),
@@ -714,11 +799,16 @@ async fn main() -> Result<()> {
     // Step 4: Foreground poller + FocusManager (macOS only)
     #[cfg(target_os = "macos")]
     let (foreground_state, focus_context) = {
-        let poller = ForegroundPoller::new(1000);
+        let (fg_activate_tx, fg_activate_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown_rx_activate = shutdown_tx.subscribe();
+        let _foreground_activate_handle =
+            spawn_foreground_activate_observer(fg_activate_tx, shutdown_rx_activate);
+
+        let poller = ForegroundPoller::new(30_000); // 30s reconciliation; activate observer is primary
         let fg_state = poller.state();
         let shutdown_rx_fg = shutdown_tx.subscribe();
         let _foreground_poller_handle = tokio::spawn(async move {
-            poller.run(shutdown_rx_fg).await;
+            poller.run(shutdown_rx_fg, Some(fg_activate_rx)).await;
         });
         let ws_state = workspace_resolver_state.clone();
         let focus_mgr = focus_manager::FocusManager::new(
@@ -759,6 +849,7 @@ async fn main() -> Result<()> {
     let api_focus_context = focus_context.clone();
     let api_fs_watcher = fs_watcher.clone();
     let api_drop_metrics = drop_metrics.clone();
+    let api_pipeline_tx = event_tx.clone();
     let api_handle = tokio::spawn(async move {
         #[cfg(target_os = "macos")]
         let router = create_router(
@@ -778,6 +869,7 @@ async fn main() -> Result<()> {
             Some(api_drop_metrics),
             Some(api_attribution_state),
             Some(api_telemetry_integrity),
+            Some(api_pipeline_tx),
         );
         #[cfg(not(target_os = "macos"))]
         let router = create_router(
@@ -793,6 +885,7 @@ async fn main() -> Result<()> {
             Some(api_drop_metrics),
             Some(api_attribution_state),
             Some(api_telemetry_integrity),
+            Some(api_pipeline_tx),
         );
         let listener = TcpListener::bind(&api_addr)
             .await
@@ -821,11 +914,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start tick emitter (select with shutdown so it exits immediately)
+    // Start tick emitter (Phase 3: configurable interval, default 10s for aggregate rules)
+    let tick_interval_secs = config.pipeline.tick_interval_secs;
     let tick_tx = raw_tx.clone();
     let mut shutdown_rx_tick = shutdown_tx.subscribe();
     let tick_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(tick_interval_secs));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
