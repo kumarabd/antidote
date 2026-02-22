@@ -27,8 +27,3 @@ ui/build/
 ui/coverage/
 ui/dist-ssr/
 ui/public/
-ui/src/assets/
-ui/src/components/
-ui/src/pages/
-ui/src/styles/
-ui/src/utils/
