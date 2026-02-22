@@ -2,6 +2,8 @@
 
 This document describes how to test and verify all Antidote features. Use the test script for automated checks and the manual steps for targeted verification.
 
+For **step-by-step validation** of each implementation phase, see [validations/](validations/README.md).
+
 ## Prerequisites
 
 - **macOS** (required for full feature set; some tests skip on other platforms)

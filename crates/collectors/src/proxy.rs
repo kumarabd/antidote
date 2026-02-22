@@ -235,6 +235,9 @@ impl ProxyServer {
             event_type: EventType::NetHttp,
             payload,
             enforcement_action: false,
+            attribution_reason: None,
+            attribution_confidence: None,
+            attribution_details_json: None,
         };
 
         let _ = event_tx.send(event);

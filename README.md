@@ -23,7 +23,7 @@ cargo build -p antidote-daemon
 cargo run -p antidote-daemon
 ```
 
-Then open **http://127.0.0.1:17845/ui/** in your browser. Add a watched root via the API so file activity is attributed:
+Then open **http://127.0.0.1:17845/ui/** in your browser. If the UI shows "UI not built", run `cd ui && npm install && npm run build` first. Add a watched root via the API so file activity is attributed:
 
 ```bash
 curl -X POST http://127.0.0.1:17845/roots -H "Content-Type: application/json" -d '{"path":"/Users/you/your-project"}'
@@ -60,6 +60,7 @@ antidote/
 │   ├── storage/      # SQLite persistence
 │   ├── api/          # HTTP API and UI
 │   └── daemon/       # Main binary and pipeline
+├── ui/               # Vite SPA (React + TypeScript) - Dashboard, Session Detail, Diagnostics
 ├── rules/rules.yaml  # Rule configuration
 ├── docs/             # User guide, testing, architecture, contributing
 └── scripts/          # Test and verification scripts

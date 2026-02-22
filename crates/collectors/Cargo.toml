@@ -20,3 +20,4 @@ time = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 regex = "1.10"
+async-trait = "0.1"

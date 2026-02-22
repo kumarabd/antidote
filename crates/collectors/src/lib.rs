@@ -6,13 +6,24 @@ mod proxy;
 mod app_detector_macos;
 #[cfg(target_os = "macos")]
 mod audit_macos;
+#[cfg(target_os = "macos")]
+mod workspace_resolver_macos;
+#[cfg(target_os = "macos")]
+mod foreground_macos;
 
-pub use fs_watcher::FsWatcherManager;
+pub use fs_watcher::{FsWatcherManager, WatcherStatus};
 pub use proxy::ProxyServer;
 #[cfg(target_os = "macos")]
 pub use app_detector_macos::{AppDetectorState, AppEvent, AppInstance, AppKind, AppDetector, MacAppDetector, DEFAULT_POLL_INTERVAL_MS};
 #[cfg(target_os = "macos")]
 pub use audit_macos::AuditCollector;
+#[cfg(target_os = "macos")]
+pub use workspace_resolver_macos::{
+    Confidence, SourceTier, WorkspaceEvent, WorkspaceResolver, WorkspaceResolverConfig,
+    WorkspaceResolverState, WorkspaceState,
+};
+#[cfg(target_os = "macos")]
+pub use foreground_macos::{ForegroundApp, ForegroundPoller, app_kind_from_name};
 
 use antidote_core::{payloads::ProcPayload, Event, EventType};
 use std::collections::HashMap;
@@ -103,6 +114,9 @@ impl ProcessPoller {
                             event_type: EventType::ProcStart,
                             payload,
                             enforcement_action: false,
+                            attribution_reason: None,
+                            attribution_confidence: None,
+                            attribution_details_json: None,
                         };
 
                         if self.event_tx.send(event).is_err() {
@@ -146,6 +160,9 @@ impl ProcessPoller {
                         event_type: EventType::ProcExit,
                         payload,
                         enforcement_action: false,
+                        attribution_reason: None,
+                        attribution_confidence: None,
+                        attribution_details_json: None,
                     };
 
                     if self.event_tx.send(event).is_err() {

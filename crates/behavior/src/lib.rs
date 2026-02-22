@@ -305,6 +305,9 @@ mod tests {
             participant_pids_count: 1,
             drift_index: None,
             baseline_comparison_summary: None,
+            enforcement_actions_count: 0,
+            forced_terminated: false,
+            summary_json: None,
         };
         let empty: HashSet<String> = HashSet::new();
         for _ in 0..20 {

@@ -3,7 +3,7 @@
 use antidote_core::{payloads::FilePayload, Event, EventType};
 use anyhow::{Context, Result};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -87,6 +87,9 @@ impl FsWatcherManager {
                             event_type,
                             payload,
                             enforcement_action: false,
+                            attribution_reason: None,
+                            attribution_confidence: None,
+                            attribution_details_json: None,
                         };
 
                         if event_tx.send(event).is_err() {
@@ -128,4 +131,54 @@ impl FsWatcherManager {
     pub fn watched_roots(&self) -> Vec<PathBuf> {
         self.watchers.keys().cloned().collect()
     }
+
+    /// Reconcile watchers to match the desired set of enabled root paths.
+    /// Adds watchers for new paths, removes watchers for paths no longer desired.
+    /// Logs errors but does not panic; continues with remaining roots.
+    pub fn reconcile_watches(&mut self, desired_roots: &[String]) {
+        let desired_set: HashSet<PathBuf> = desired_roots
+            .iter()
+            .filter_map(|p| {
+                let path = PathBuf::from(p);
+                path.canonicalize().ok().or_else(|| Some(path))
+            })
+            .filter(|p| p.exists())
+            .collect();
+        let current: Vec<PathBuf> = self.watchers.keys().cloned().collect();
+        let current_set: HashSet<PathBuf> = current.iter().cloned().collect();
+        let to_add: Vec<PathBuf> = desired_set.difference(&current_set).cloned().collect();
+        let to_remove: Vec<PathBuf> = current_set.difference(&desired_set).cloned().collect();
+        for root in to_remove {
+            if let Some(mut watcher) = self.watchers.remove(&root) {
+                if let Err(e) = watcher.unwatch(&root) {
+                    warn!("Failed to unwatch {:?}: {}", root, e);
+                } else {
+                    info!("Removed FS watch root: {:?}", root);
+                }
+            }
+        }
+        for root in to_add {
+            if let Err(e) = self.add_root(root.clone()) {
+                warn!("Failed to add watch {:?}: {}", root, e);
+            }
+        }
+    }
+
+    /// Return current watcher status for debug: path -> status (running).
+    pub fn watcher_status(&self) -> Vec<WatcherStatus> {
+        self.watchers
+            .keys()
+            .map(|p| WatcherStatus {
+                path: p.to_string_lossy().to_string(),
+                status: "running".to_string(),
+            })
+            .collect()
+    }
+}
+
+/// Per-watcher status for debug endpoint
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WatcherStatus {
+    pub path: String,
+    pub status: String,
 }

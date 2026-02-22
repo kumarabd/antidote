@@ -277,7 +277,7 @@ impl SessionManager {
         }
     }
 
-    /// Get sessions that have a watched root matching a path
+    /// Get sessions that have a watched root matching a path (candidate or observed roots)
     pub async fn get_sessions_for_path(&self, path: &str) -> Vec<String> {
         let sessions = self.sessions.read().await;
         let mut matching = Vec::new();
@@ -285,15 +285,55 @@ impl SessionManager {
             if !session.is_active() {
                 continue;
             }
-            // Check if path is under any candidate root
-            for root in &session.candidate_roots {
-                if path.starts_with(root) {
-                    matching.push(session_id.clone());
-                    break;
-                }
+            let under_candidate = session.candidate_roots.iter().any(|root| path.starts_with(root));
+            let under_observed = session.observed_roots.iter().any(|root| path.starts_with(root));
+            if under_candidate || under_observed {
+                matching.push(session_id.clone());
             }
         }
         matching
+    }
+
+    /// Get session_id for a pid if known (from ProcStart mapping)
+    pub async fn get_session_for_pid(&self, pid: i32) -> Option<String> {
+        self.pid_to_session.read().await.get(&pid).cloned()
+    }
+
+    /// Step 5: End and unregister session for pid (from AppEvent::Exited). Returns session_id if found.
+    pub async fn end_session_for_pid(&self, pid: i32) -> Option<String> {
+        let session_id = self.pid_to_session.write().await.remove(&pid)?;
+        let mut sessions = self.sessions.write().await;
+        if let Some(s) = sessions.get_mut(&session_id) {
+            s.end();
+        }
+        Some(session_id)
+    }
+
+    /// Step 5: Register a session created by SessionLifecycleManager (from AppEvent::Started).
+    /// Inserts into in-memory registry; caller must persist to DB.
+    pub async fn register_session_from_app(&self, session_id: String, app: String, root_pid: i32) {
+        let state = SessionState::new(session_id.clone(), app, root_pid);
+        {
+            let mut pid_map = self.pid_to_session.write().await;
+            pid_map.insert(root_pid, session_id.clone());
+        }
+        self.sessions.write().await.insert(session_id, state);
+    }
+
+    /// Ensure a Cursor session exists for this pid; create lightweight one if not. Returns session_id.
+    pub async fn ensure_cursor_session(&self, pid: i32) -> String {
+        if let Some(sid) = self.pid_to_session.read().await.get(&pid) {
+            return sid.clone();
+        }
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let app = "Cursor".to_string();
+        {
+            let mut pid_map = self.pid_to_session.write().await;
+            pid_map.insert(pid, session_id.clone());
+        }
+        let state = SessionState::new(session_id.clone(), app, pid);
+        self.sessions.write().await.insert(session_id.clone(), state);
+        session_id
     }
 
     /// Get all active sessions
@@ -303,6 +343,24 @@ impl SessionManager {
             .values()
             .filter(|s| s.is_active())
             .map(|s| s.summary.clone())
+            .collect()
+    }
+
+    /// Active sessions with combined roots (candidate + observed) for attribution.
+    pub async fn get_active_sessions_with_roots(&self) -> Vec<(SessionSummary, Vec<String>)> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .filter(|s| s.is_active())
+            .map(|s| {
+                let mut roots: Vec<String> = s.candidate_roots.iter().cloned().collect();
+                for r in &s.observed_roots {
+                    if !roots.contains(r) {
+                        roots.push(r.clone());
+                    }
+                }
+                (s.summary.clone(), roots)
+            })
             .collect()
     }
 

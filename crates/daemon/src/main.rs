@@ -1,12 +1,25 @@
 //! Antidote daemon - main entry point
 
+mod attribution_engine;
+mod attribution_state;
+mod auto_root_manager;
+mod telemetry_integrity;
+mod file_event_coalescer;
+mod focus_manager;
+mod ignore_filters;
 mod pipeline;
+mod rate_limiter;
+mod root_policy;
+mod session_lifecycle;
 
 use antidote_api::create_router;
 use antidote_behavior;
 use antidote_collectors::{FsWatcherManager, ProcessPoller, ProxyServer};
 #[cfg(target_os = "macos")]
-use antidote_collectors::{AppDetectorState, AppEvent, AppDetector, MacAppDetector};
+use antidote_collectors::{
+    AppDetectorState, AppEvent, AppDetector, ForegroundPoller, MacAppDetector,
+    WorkspaceResolver, WorkspaceResolverConfig, WorkspaceResolverState,
+};
 use antidote_core::{
     Event, EventType, Flag, Label, SessionSummary, Severity,
     EnforcementConfig, SafeModeConfig,
@@ -20,7 +33,6 @@ use pipeline::PipelineWorker;
 use std::collections::HashMap;
 use time::format_description::well_known::Rfc3339;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -71,6 +83,22 @@ struct ProxyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RetentionConfig {
     days: u64,
+    #[serde(default = "default_events_days")]
+    events_days: u64,
+    #[serde(default = "default_sessions_days")]
+    sessions_days: u64,
+    #[serde(default = "default_run_every_minutes")]
+    run_every_minutes: u64,
+}
+
+fn default_events_days() -> u64 {
+    7
+}
+fn default_sessions_days() -> u64 {
+    90
+}
+fn default_run_every_minutes() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +117,133 @@ impl Default for AppDetectorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceResolverConfigDaemon {
+    enabled: bool,
+    poll_interval_ms: u64,
+    max_roots_per_app: usize,
+    dev_dir_candidates: Vec<String>,
+    lsof_fallback_enabled: bool,
+    lsof_min_interval_ms: u64,
+}
+
+impl Default for WorkspaceResolverConfigDaemon {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_ms: 5000,
+            max_roots_per_app: 5,
+            dev_dir_candidates: vec![
+                "~/code".to_string(),
+                "~/dev".to_string(),
+                "~/projects".to_string(),
+                "~/workspace".to_string(),
+                "~/Documents".to_string(),
+            ],
+            lsof_fallback_enabled: true,
+            lsof_min_interval_ms: 30000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoRootConfigDaemon {
+    enabled: bool,
+    max_auto_roots: usize,
+    stale_disable_days: u32,
+    apply_debounce_ms: u64,
+    #[serde(default = "default_min_presence_seconds")]
+    min_presence_seconds: u64,
+}
+
+fn default_min_presence_seconds() -> u64 {
+    5
+}
+
+impl Default for AutoRootConfigDaemon {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_auto_roots: 20,
+            stale_disable_days: 14,
+            apply_debounce_ms: 2000,
+            min_presence_seconds: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileEventsConfig {
+    #[serde(default = "default_coalesce_window_ms")]
+    coalesce_window_ms: u64,
+}
+
+fn default_coalesce_window_ms() -> u64 {
+    800
+}
+
+impl Default for FileEventsConfig {
+    fn default() -> Self {
+        Self {
+            coalesce_window_ms: 800,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FocusConfig {
+    #[serde(default = "default_stabilization_ms")]
+    stabilization_ms: u64,
+}
+
+fn default_stabilization_ms() -> u64 {
+    1000
+}
+
+impl Default for FocusConfig {
+    fn default() -> Self {
+        Self {
+            stabilization_ms: 1000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttributionConfig {
+    #[serde(default = "default_recent_session_window_seconds")]
+    recent_session_window_seconds: u64,
+}
+
+fn default_recent_session_window_seconds() -> u64 {
+    300
+}
+
+impl Default for AttributionConfig {
+    fn default() -> Self {
+        Self {
+            recent_session_window_seconds: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LimitsConfig {
+    #[serde(default = "default_max_events_per_second")]
+    max_events_per_second: u32,
+}
+
+fn default_max_events_per_second() -> u32 {
+    200
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_events_per_second: 200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     db_url: String,
     listen_addr: String,
@@ -101,6 +256,18 @@ struct Config {
     retention: RetentionConfig,
     #[serde(default)]
     app_detector: AppDetectorConfig,
+    #[serde(default)]
+    workspace_resolver: WorkspaceResolverConfigDaemon,
+    #[serde(default)]
+    auto_roots: AutoRootConfigDaemon,
+    #[serde(default)]
+    file_events: FileEventsConfig,
+    #[serde(default)]
+    limits: LimitsConfig,
+    #[serde(default)]
+    focus: FocusConfig,
+    #[serde(default)]
+    attribution: AttributionConfig,
     #[serde(default)]
     enforcement: EnforcementConfig,
     #[serde(default)]
@@ -115,18 +282,104 @@ impl Default for Config {
             rules_path: "./rules/rules.yaml".to_string(),
             watch_processes: vec!["Cursor".to_string(), "Code".to_string(), "Claude".to_string()],
             poll_interval_secs: 2,
-            idle_timeout_minutes: 7,
+            idle_timeout_minutes: 20,
             fs: FsConfig { debounce_ms: 1000 },
             proxy: ProxyConfig {
                 enabled: true,
                 listen_addr: "127.0.0.1:17846".to_string(),
             },
-            retention: RetentionConfig { days: 7 },
+            retention: RetentionConfig {
+                days: 7,
+                events_days: 7,
+                sessions_days: 90,
+                run_every_minutes: 60,
+            },
             app_detector: AppDetectorConfig::default(),
+            workspace_resolver: WorkspaceResolverConfigDaemon::default(),
+            auto_roots: AutoRootConfigDaemon::default(),
+            file_events: FileEventsConfig::default(),
+            limits: LimitsConfig::default(),
+            focus: FocusConfig::default(),
+            attribution: AttributionConfig::default(),
             enforcement: EnforcementConfig::default(),
             safe_mode: SafeModeConfig::default(),
         }
     }
+}
+
+/// Step 5: Post-finalize processing (baseline, anomaly, escalation, drift)
+async fn process_finalized_session(
+    storage: &Storage,
+    baselines: &tokio::sync::RwLock<std::collections::HashMap<String, antidote_behavior::AppBaseline>>,
+    mut summary: antidote_core::SessionSummary,
+) {
+    let now = time::OffsetDateTime::now_utc();
+    if summary.end_ts.is_none() {
+        summary.end_ts = Some(now);
+    }
+    let current = baselines.read().await.get(&summary.app).cloned();
+    let new_baseline = antidote_behavior::update_baseline_ema(
+        current.as_ref(),
+        &summary.app,
+        &summary.counts,
+        antidote_behavior::DEFAULT_EMA_ALPHA,
+        now,
+    );
+    let row = AppBaselineRow {
+        app: new_baseline.app.clone(),
+        session_count: new_baseline.session_count as i64,
+        avg_files_written: new_baseline.avg_files_written,
+        avg_files_deleted: new_baseline.avg_files_deleted,
+        avg_bytes_out: new_baseline.avg_bytes_out,
+        avg_unknown_domains: new_baseline.avg_unknown_domains,
+        avg_cmds: new_baseline.avg_cmds,
+        var_files_written: new_baseline.var_files_written,
+        var_bytes_out: new_baseline.var_bytes_out,
+        var_unknown_domains: new_baseline.var_unknown_domains,
+        var_cmds: new_baseline.var_cmds,
+        last_updated: new_baseline.last_updated.format(&time::format_description::well_known::Rfc3339).unwrap_or_default().to_string(),
+    };
+    let _ = storage.upsert_app_baseline(&row).await;
+    baselines.write().await.insert(summary.app.clone(), new_baseline.clone());
+
+    let baseline_guard = baselines.read().await;
+    let baseline_ref = baseline_guard.get(&summary.app);
+    let anomaly_flags = antidote_behavior::detect_anomalies(
+        &summary.session_id,
+        &summary.app,
+        &summary.counts,
+        &summary.evidence,
+        baseline_ref,
+        &antidote_behavior::AnomalyConfig::default(),
+    );
+    let risk_counts = storage
+        .get_risk_history_last_n_days(&summary.app, antidote_behavior::ESCALATION_DAYS)
+        .await
+        .unwrap_or_default();
+    let escalation_flag = antidote_behavior::check_escalation(&summary.session_id, &summary.app, &risk_counts);
+    let mut all_new_flags = anomaly_flags;
+    if let Some(f) = escalation_flag {
+        all_new_flags.push(f);
+    }
+    for flag in &all_new_flags {
+        let _ = storage.insert_flags(&[flag.clone()]).await;
+        if matches!(flag.severity, Severity::High | Severity::Crit) {
+            let _ = storage.record_risk_history(&summary.app, &flag.rule_id, flag.ts).await;
+        }
+    }
+
+    let drift_index = antidote_behavior::compute_drift_index(
+        &summary,
+        baseline_ref,
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+        0.0,
+    );
+    let baseline_comp = antidote_behavior::build_baseline_comparison_summary(&summary, baseline_ref);
+    summary.drift_index = Some(drift_index);
+    summary.baseline_comparison_summary = baseline_comp;
+
+    let _ = storage.upsert_session_summary(&summary).await;
 }
 
 /// Phase 6: Run emergency freeze - kill active session processes and mark sessions forced_terminated
@@ -274,8 +527,13 @@ async fn main() -> Result<()> {
     ));
     info!("Session manager initialized");
 
-    // Create event channel
+    // Create event channels: raw -> coalescer (ignore + coalesce) -> pipeline
+    let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Event>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+
+    // Step 6: Rate limiter and drop metrics (for pipeline and debug endpoints)
+    let drop_metrics = Arc::new(rate_limiter::EventDropMetrics::default());
+    let rate_limiter = Arc::new(rate_limiter::RateLimiter::new(config.limits.max_events_per_second));
 
     // Phase 6: Enforcement state (shared with API and proxy)
     let enforcement_state: Arc<RwLock<EnforcementConfig>> =
@@ -296,25 +554,46 @@ async fn main() -> Result<()> {
         let _ = storage.upsert_session_summary(&enforcement_session).await;
     }
 
-    // Initialize FS watcher manager
-    let fs_watcher = Arc::new(RwLock::new(FsWatcherManager::new(event_tx.clone())));
+    // Initialize FS watcher manager (sends to raw_tx; coalescer filters and forwards to pipeline)
+    let fs_watcher = Arc::new(RwLock::new(FsWatcherManager::new(raw_tx.clone())));
     
-    // Load and start watching enabled roots
+    // Load and start watching enabled roots; shared cache for pipeline and AutoRootManager
     let enabled_roots = storage.get_enabled_roots().await
         .context("Failed to load watched roots")?;
+    let watched_roots_cache = Arc::new(RwLock::new(enabled_roots.clone()));
     {
         let mut watcher = fs_watcher.write().await;
-        for root_path in &enabled_roots {
-            if let Err(e) = watcher.add_root(PathBuf::from(root_path)) {
-                warn!("Failed to watch root {}: {}", root_path, e);
-            }
-        }
+        watcher.reconcile_watches(&enabled_roots);
     }
     info!("FS watcher initialized with {} roots", enabled_roots.len());
 
     // Shutdown signal for graceful server exit (API server never exits otherwise)
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let mut shutdown_rx = shutdown_tx.subscribe();
+
+    // Step 5: Session lifecycle manager (macOS: creates on AppStarted, ends on AppExited, idle rotation)
+    #[cfg(target_os = "macos")]
+    let (lifecycle, app_detector_lifecycle) = {
+        let lifecycle_storage = storage.clone();
+        let lifecycle_baselines = baseline_cache.clone();
+        let lc = Arc::new(
+            session_lifecycle::SessionLifecycleManager::new(
+                session_manager.clone(),
+                storage.clone(),
+                config.idle_timeout_minutes,
+            )
+            .with_on_finalize(Arc::new(move |summary| {
+                let st = lifecycle_storage.clone();
+                let bl = lifecycle_baselines.clone();
+                Box::pin(async move {
+                    process_finalized_session(&*st, &bl, summary).await;
+                })
+            })),
+        );
+        (Some(lc.clone()), Some(lc))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (lifecycle, app_detector_lifecycle) = (None as Option<Arc<session_lifecycle::SessionLifecycleManager>>, None);
 
     // App detector (macOS only): lifecycle events for Cursor/VSCode/Claude
     #[cfg(target_os = "macos")]
@@ -327,9 +606,11 @@ async fn main() -> Result<()> {
             let detector = MacAppDetector::new(config.app_detector.poll_interval_ms);
             let mut detector_handle = detector.start(app_event_tx);
             let consumer_state = state.clone();
+            let consumer_lifecycle = app_detector_lifecycle.clone().unwrap();
             let consumer_handle = tokio::spawn(async move {
                 let mut by_pid: std::collections::HashMap<i32, antidote_collectors::AppInstance> = std::collections::HashMap::new();
                 while let Some(ev) = app_event_rx.recv().await {
+                    consumer_lifecycle.handle_app_event(ev.clone()).await;
                     match ev {
                         AppEvent::Started { app, pid, bundle_id, started_at } => {
                             info!("App started: {} pid={}", app.as_display_str(), pid);
@@ -366,6 +647,96 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let app_detector_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Workspace resolver (macOS only): infers workspace roots; optional channel for AutoRootManager
+    #[cfg(target_os = "macos")]
+    let (workspace_resolver_state, workspace_resolver_handle, workspace_event_rx) = {
+        if !config.workspace_resolver.enabled || app_detector_state.is_none() {
+            (None, None, None)
+        } else {
+            let state = Arc::new(RwLock::new(WorkspaceResolverState::default()));
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<antidote_collectors::WorkspaceEvent>();
+            let resolver_config = WorkspaceResolverConfig {
+                poll_interval_ms: config.workspace_resolver.poll_interval_ms,
+                max_roots_per_app: config.workspace_resolver.max_roots_per_app,
+                dev_dir_candidates: config.workspace_resolver.dev_dir_candidates.clone(),
+                lsof_fallback_enabled: config.workspace_resolver.lsof_fallback_enabled,
+                lsof_min_interval_ms: config.workspace_resolver.lsof_min_interval_ms,
+            };
+            let resolver = WorkspaceResolver::new(resolver_config, state.clone(), Some(event_tx));
+            let app_state = app_detector_state.clone().unwrap();
+            let shutdown_rx_ws = shutdown_tx.subscribe();
+            let handle = tokio::spawn(async move {
+                resolver.run(app_state, shutdown_rx_ws).await;
+            });
+            (Some(state), Some(handle), Some(event_rx))
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let workspace_resolver_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    // AutoRootManager (macOS only): consumes WorkspaceEvent, upserts auto roots, reconciles watchers
+    #[cfg(target_os = "macos")]
+    let auto_root_manager_handle = {
+        if config.auto_roots.enabled && workspace_event_rx.is_some() {
+            let event_rx = workspace_event_rx.unwrap();
+            let manager = Arc::new(auto_root_manager::AutoRootManager::new(
+                auto_root_manager::AutoRootConfig {
+                    enabled: config.auto_roots.enabled,
+                    max_auto_roots: config.auto_roots.max_auto_roots,
+                    stale_disable_days: config.auto_roots.stale_disable_days,
+                    apply_debounce_ms: config.auto_roots.apply_debounce_ms,
+                    min_presence_seconds: config.auto_roots.min_presence_seconds,
+                },
+                storage.clone(),
+                fs_watcher.clone(),
+                watched_roots_cache.clone(),
+            ));
+            let shutdown_rx_arm = shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                manager.run(event_rx, shutdown_rx_arm).await;
+            }))
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let auto_root_manager_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Step 8: Telemetry integrity (capabilities, confidence, health, attribution quality, etc.)
+    let telemetry_integrity = Arc::new(telemetry_integrity::TelemetryIntegrityState::new());
+
+    // Step 7: Attribution state (heat, PID cache, stabilization)
+    let attribution_state = Arc::new(attribution_state::AttributionState::new(
+        config.focus.stabilization_ms,
+        10, // PID cache TTL minutes
+    ));
+
+    // Step 4: Foreground poller + FocusManager (macOS only)
+    #[cfg(target_os = "macos")]
+    let (foreground_state, focus_context) = {
+        let poller = ForegroundPoller::new(1000);
+        let fg_state = poller.state();
+        let shutdown_rx_fg = shutdown_tx.subscribe();
+        let _foreground_poller_handle = tokio::spawn(async move {
+            poller.run(shutdown_rx_fg).await;
+        });
+        let ws_state = workspace_resolver_state.clone();
+        let focus_mgr = focus_manager::FocusManager::new(
+            fg_state.clone(),
+            ws_state,
+            session_manager.clone(),
+            Some(attribution_state.clone()),
+        );
+        let focus_ctx = focus_mgr.context();
+        let shutdown_rx_focus = shutdown_tx.subscribe();
+        let _focus_manager_handle = tokio::spawn(async move {
+            focus_mgr.run(shutdown_rx_focus).await;
+        });
+        (Some(fg_state), Some(focus_ctx))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (foreground_state, focus_context) = (None, None);
+
     // Start API server with graceful shutdown
     let api_storage = storage.clone();
     let api_session_manager = session_manager.clone();
@@ -376,8 +747,18 @@ async fn main() -> Result<()> {
     let api_safe_mode = safe_mode_state.clone();
     let api_frozen = frozen_state.clone();
     let api_freeze_tx = freeze_tx.clone();
+    let api_attribution_state = attribution_state.clone();
+    let api_telemetry_integrity = telemetry_integrity.clone();
     #[cfg(target_os = "macos")]
     let api_app_detector_state = app_detector_state.clone();
+    #[cfg(target_os = "macos")]
+    let api_workspace_resolver_state = workspace_resolver_state.clone();
+    #[cfg(target_os = "macos")]
+    let api_foreground_state = foreground_state.clone();
+    #[cfg(target_os = "macos")]
+    let api_focus_context = focus_context.clone();
+    let api_fs_watcher = fs_watcher.clone();
+    let api_drop_metrics = drop_metrics.clone();
     let api_handle = tokio::spawn(async move {
         #[cfg(target_os = "macos")]
         let router = create_router(
@@ -390,6 +771,13 @@ async fn main() -> Result<()> {
             api_frozen,
             Some(api_freeze_tx),
             api_app_detector_state,
+            api_workspace_resolver_state,
+            Some(api_fs_watcher),
+            api_foreground_state,
+            api_focus_context,
+            Some(api_drop_metrics),
+            Some(api_attribution_state),
+            Some(api_telemetry_integrity),
         );
         #[cfg(not(target_os = "macos"))]
         let router = create_router(
@@ -401,6 +789,10 @@ async fn main() -> Result<()> {
             api_safe_mode,
             api_frozen,
             Some(api_freeze_tx),
+            Some(api_fs_watcher),
+            Some(api_drop_metrics),
+            Some(api_attribution_state),
+            Some(api_telemetry_integrity),
         );
         let listener = TcpListener::bind(&api_addr)
             .await
@@ -415,7 +807,7 @@ async fn main() -> Result<()> {
     });
 
     // Start process poller (select with shutdown so it exits on Ctrl+C even when idle)
-    let poller_tx = event_tx.clone();
+    let poller_tx = raw_tx.clone();
     let mut poller = ProcessPoller::new(
         config.watch_processes.clone(),
         poller_tx,
@@ -430,7 +822,7 @@ async fn main() -> Result<()> {
     });
 
     // Start tick emitter (select with shutdown so it exits immediately)
-    let tick_tx = event_tx.clone();
+    let tick_tx = raw_tx.clone();
     let mut shutdown_rx_tick = shutdown_tx.subscribe();
     let tick_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -444,6 +836,9 @@ async fn main() -> Result<()> {
                         event_type: EventType::Tick,
                         payload: serde_json::json!({}),
                         enforcement_action: false,
+                        attribution_reason: None,
+                        attribution_confidence: None,
+                        attribution_details_json: None,
                     };
                     if tick_tx.send(event).is_err() {
                         break;
@@ -454,7 +849,31 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start pipeline worker
+    // Step 6: Coalescer task (ignore filter + coalesce file events)
+    let coalesce_window = config.file_events.coalesce_window_ms;
+    let coalescer_handle = tokio::spawn(file_event_coalescer::coalescer_task(
+        raw_rx,
+        event_tx.clone(),
+        coalesce_window,
+    ));
+
+    // Step 7: Periodic PID cache eviction
+    let eviction_attr = attribution_state.clone();
+    let mut shutdown_rx_evict = shutdown_tx.subscribe();
+    let _eviction_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    eviction_attr.evict_stale_pids(time::OffsetDateTime::now_utc()).await;
+                }
+                _ = shutdown_rx_evict.recv() => break,
+            }
+        }
+    });
+
+    // Start pipeline worker (shares watched_roots_cache with AutoRootManager; focus_context for attribution)
+    let pipeline_focus = focus_context.clone();
     let pipeline = PipelineWorker::new(
         storage.clone(),
         rule_engine.clone(),
@@ -462,6 +881,13 @@ async fn main() -> Result<()> {
         event_rx,
         enforcement_state.clone(),
         safe_mode_state.clone(),
+        watched_roots_cache.clone(),
+        pipeline_focus,
+        Some(rate_limiter.clone()),
+        Some(drop_metrics.clone()),
+        Some(attribution_state.clone()),
+        config.attribution.recent_session_window_seconds,
+        Some(telemetry_integrity.clone()),
     );
     let pipeline_handle = tokio::spawn(async move {
         pipeline.run().await;
@@ -497,7 +923,7 @@ async fn main() -> Result<()> {
         let proxy_addr = config.proxy.listen_addr.parse()
             .context("Invalid proxy listen address")?;
         let known_domains = rule_engine.known_domains().to_vec();
-        let proxy = ProxyServer::new(proxy_addr, event_tx.clone())
+        let proxy = ProxyServer::new(proxy_addr, raw_tx.clone())
             .with_enforcement(
                 known_domains,
                 enforcement_state.clone(),
@@ -524,102 +950,36 @@ async fn main() -> Result<()> {
     let idle_manager = session_manager.clone();
     let idle_storage = storage.clone();
     let idle_baselines = baseline_cache.clone();
+    let idle_lifecycle = lifecycle.clone();
     let mut shutdown_rx_idle = shutdown_tx.subscribe();
     let idle_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let ended = idle_manager.check_idle_timeout().await;
-                    for session_id in ended {
-                        // Prefer summary from storage (has latest counts from pipeline)
-                        let mut summary_opt = idle_storage.get_session(&session_id).await.ok().flatten();
-                        if summary_opt.is_none() {
-                            summary_opt = idle_manager.get_session(&session_id).await;
-                        }
-                        let mut summary = match summary_opt {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        let now = time::OffsetDateTime::now_utc();
-                        if summary.end_ts.is_none() {
-                            summary.end_ts = Some(now);
-                        }
-
-                        // Phase 5: Update baseline (EMA)
-                        let current = idle_baselines.read().await.get(&summary.app).cloned();
-                        let new_baseline = antidote_behavior::update_baseline_ema(
-                            current.as_ref(),
-                            &summary.app,
-                            &summary.counts,
-                            antidote_behavior::DEFAULT_EMA_ALPHA,
-                            now,
-                        );
-                        let row = AppBaselineRow {
-                            app: new_baseline.app.clone(),
-                            session_count: new_baseline.session_count as i64,
-                            avg_files_written: new_baseline.avg_files_written,
-                            avg_files_deleted: new_baseline.avg_files_deleted,
-                            avg_bytes_out: new_baseline.avg_bytes_out,
-                            avg_unknown_domains: new_baseline.avg_unknown_domains,
-                            avg_cmds: new_baseline.avg_cmds,
-                            var_files_written: new_baseline.var_files_written,
-                            var_bytes_out: new_baseline.var_bytes_out,
-                            var_unknown_domains: new_baseline.var_unknown_domains,
-                            var_cmds: new_baseline.var_cmds,
-                            last_updated: new_baseline.last_updated.format(&Rfc3339).unwrap_or_default().to_string(),
-                        };
-                        let _ = idle_storage.upsert_app_baseline(&row).await;
-                        idle_baselines.write().await.insert(summary.app.clone(), new_baseline.clone());
-
-                        // Anomaly detection (keep read guard alive for baseline_ref uses below)
-                        let baseline_guard = idle_baselines.read().await;
-                        let baseline_ref = baseline_guard.get(&summary.app);
-                        let anomaly_flags = antidote_behavior::detect_anomalies(
-                            &summary.session_id,
-                            &summary.app,
-                            &summary.counts,
-                            &summary.evidence,
-                            baseline_ref,
-                            &antidote_behavior::AnomalyConfig::default(),
-                        );
-                        // Escalation (risk history already recorded when flags were created)
-                        let risk_counts = idle_storage
-                            .get_risk_history_last_n_days(&summary.app, antidote_behavior::ESCALATION_DAYS)
-                            .await
-                            .unwrap_or_default();
-                        let escalation_flag = antidote_behavior::check_escalation(
-                            &summary.session_id,
-                            &summary.app,
-                            &risk_counts,
-                        );
-                        let mut all_new_flags = anomaly_flags;
-                        if let Some(f) = escalation_flag {
-                            all_new_flags.push(f);
-                        }
-                        for flag in &all_new_flags {
-                            let _ = idle_storage.insert_flags(&[flag.clone()]).await;
-                            if matches!(flag.severity, Severity::High | Severity::Crit) {
-                                let _ = idle_storage.record_risk_history(&summary.app, &flag.rule_id, flag.ts).await;
+                    let to_process: Vec<SessionSummary> = if let Some(ref lc) = idle_lifecycle {
+                        lc.run_idle_rotation().await
+                    } else {
+                        let ended = idle_manager.check_idle_timeout().await;
+                        let mut out = Vec::new();
+                        for session_id in ended {
+                            let from_storage = idle_storage.get_session(&session_id).await.ok().flatten();
+                            let summary_opt = if from_storage.is_some() {
+                                from_storage
+                            } else {
+                                idle_manager.get_session(&session_id).await
+                            };
+                            if let Some(mut s) = summary_opt {
+                                if s.end_ts.is_none() {
+                                    s.end_ts = Some(time::OffsetDateTime::now_utc());
+                                }
+                                out.push(s);
                             }
                         }
-
-                        // Drift index (simplified: no historical sets here)
-                        let drift_index = antidote_behavior::compute_drift_index(
-                            &summary,
-                            baseline_ref,
-                            &std::collections::HashSet::new(),
-                            &std::collections::HashSet::new(),
-                            0.0,
-                        );
-                        let baseline_comp =
-                            antidote_behavior::build_baseline_comparison_summary(&summary, baseline_ref);
-                        summary.drift_index = Some(drift_index);
-                        summary.baseline_comparison_summary = baseline_comp;
-
-                        if let Err(e) = idle_storage.upsert_session_summary(&summary).await {
-                            warn!("Failed to persist ended session {}: {}", session_id, e);
-                        }
+                        out
+                    };
+                    for summary in to_process {
+                        process_finalized_session(&*idle_storage, &idle_baselines, summary).await;
                     }
                 }
                 _ = shutdown_rx_idle.recv() => break,
@@ -629,14 +989,15 @@ async fn main() -> Result<()> {
 
     // Start retention/pruning task (listens for shutdown so it can exit)
     let retention_storage = storage.clone();
-    let retention_days = config.retention.days;
+    let events_retention_days = config.retention.events_days;
+    let run_every_minutes = config.retention.run_every_minutes;
     let mut shutdown_rx_retention = shutdown_tx.subscribe();
     let retention_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(86400)); // Daily
+        let mut interval = tokio::time::interval(Duration::from_secs(run_every_minutes * 60));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(retention_days as i64);
+                    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(events_retention_days as i64);
                     if let Err(e) = retention_storage.prune_events_older_than(cutoff).await {
                         warn!("Failed to prune events: {}", e);
                     }
@@ -665,6 +1026,7 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(());
 
     info!("Closing event and control channels (pipeline, freeze, flags)...");
+    drop(raw_tx);
     drop(event_tx);
     drop(freeze_tx);
     drop(flag_tx);
@@ -673,6 +1035,7 @@ async fn main() -> Result<()> {
         ("API server", TaskHandle::WithResult(api_handle)),
         ("process poller", TaskHandle::Unit(poller_handle)),
         ("tick emitter", TaskHandle::Unit(tick_handle)),
+        ("coalescer", TaskHandle::Unit(coalescer_handle)),
         ("pipeline worker", TaskHandle::Unit(pipeline_handle)),
         ("idle/baseline task", TaskHandle::Unit(idle_handle)),
         ("retention pruner", TaskHandle::Unit(retention_handle)),
@@ -684,6 +1047,14 @@ async fn main() -> Result<()> {
     }
     if let Some(app_detector_h) = app_detector_handle {
         task_list.push(("app detector", TaskHandle::Unit(app_detector_h)));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(ws_h) = workspace_resolver_handle {
+        task_list.push(("workspace resolver", TaskHandle::Unit(ws_h)));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(arm_h) = auto_root_manager_handle {
+        task_list.push(("auto root manager", TaskHandle::Unit(arm_h)));
     }
 
     let tasks = Arc::new(Mutex::new(task_list));

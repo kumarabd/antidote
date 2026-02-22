@@ -8,6 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use crate::rate_limiter::{RateLimiter, EventDropMetrics};
+
+use antidote_core::ForegroundContext;
+use crate::attribution_engine::{self, build_attribution_context};
+use crate::attribution_state::AttributionState;
+use crate::telemetry_integrity::TelemetryIntegrityState;
+use time::OffsetDateTime;
 
 /// Pipeline worker that processes events through the system
 pub struct PipelineWorker {
@@ -23,6 +30,17 @@ pub struct PipelineWorker {
     enforcement: Arc<tokio::sync::RwLock<EnforcementConfig>>,
     /// Phase 6: Safe mode config (allowed_roots, domain allowlist in proxy)
     safe_mode: Arc<tokio::sync::RwLock<SafeModeConfig>>,
+    /// Step 4: Focus context for attribution (optional; default used if None)
+    focus_context: Option<Arc<tokio::sync::RwLock<ForegroundContext>>>,
+    /// Step 6: Rate limiter and drop metrics
+    rate_limiter: Option<Arc<RateLimiter>>,
+    drop_metrics: Option<Arc<EventDropMetrics>>,
+    /// Step 7: Attribution state (heat, PID cache, stabilization)
+    attribution_state: Option<Arc<AttributionState>>,
+    /// Step 7: Recent session window for network events (seconds)
+    recent_session_window_seconds: u64,
+    /// Step 8: Telemetry integrity (attribution quality, root coverage, pipeline)
+    telemetry_integrity: Option<Arc<TelemetryIntegrityState>>,
 }
 
 impl PipelineWorker {
@@ -58,6 +76,13 @@ impl PipelineWorker {
         event_rx: mpsc::UnboundedReceiver<Event>,
         enforcement: Arc<tokio::sync::RwLock<EnforcementConfig>>,
         safe_mode: Arc<tokio::sync::RwLock<SafeModeConfig>>,
+        watched_roots: Arc<tokio::sync::RwLock<Vec<String>>>,
+        focus_context: Option<Arc<tokio::sync::RwLock<ForegroundContext>>>,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        drop_metrics: Option<Arc<EventDropMetrics>>,
+        attribution_state: Option<Arc<AttributionState>>,
+        recent_session_window_seconds: u64,
+        telemetry_integrity: Option<Arc<TelemetryIntegrityState>>,
     ) -> Self {
         Self {
             storage,
@@ -65,9 +90,15 @@ impl PipelineWorker {
             session_manager,
             event_rx,
             session_states: HashMap::new(),
-            watched_roots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            watched_roots,
             enforcement,
             safe_mode,
+            focus_context,
+            rate_limiter,
+            drop_metrics,
+            attribution_state,
+            recent_session_window_seconds,
+            telemetry_integrity,
         }
     }
 
@@ -94,11 +125,72 @@ impl PipelineWorker {
             tokio::select! {
                 event_opt = self.event_rx.recv() => {
                     if let Some(mut event) = event_opt {
-                        // Get or assign session for this event using heuristics
-                        let session_id = self.resolve_session_id(&event).await;
-                        event.session_id = session_id.clone();
+                        if let Some(ref ti) = &self.telemetry_integrity {
+                            ti.record_event_received();
+                        }
+                        // Step 6: Rate limit - drop if over threshold
+                        if let (Some(ref limiter), Some(ref metrics)) = (&self.rate_limiter, &self.drop_metrics) {
+                            if !limiter.allow() {
+                                metrics.record_drop();
+                                if let Some(ref ti) = &self.telemetry_integrity {
+                                    ti.record_event_dropped();
+                                }
+                                continue;
+                            }
+                        }
+                        // Step 4: ProcStart — ensure session exists before attribution
+                        if event.event_type == EventType::ProcStart {
+                            let roots = self.storage.get_enabled_roots().await.ok();
+                            let _ = self.session_manager.get_or_assign_session(&event, roots).await;
+                            self.session_manager.update_foreground_from_activity().await;
+                        }
+                        let focus = match &self.focus_context {
+                            Some(c) => c.read().await.clone(),
+                            None => ForegroundContext::default(),
+                        };
+                        let roots = self.watched_roots.read().await.clone();
+                        let ctx = build_attribution_context(
+                            focus,
+                            self.session_manager.clone(),
+                            roots,
+                            self.attribution_state.clone(),
+                            self.recent_session_window_seconds,
+                        )
+                        .await;
+                        let attr = attribution_engine::attribute(&event, &ctx);
+                        event.session_id = attr.session_id.clone();
+                        event.attribution_reason = Some(attr.reason);
+                        event.attribution_confidence = Some(attr.confidence);
+                        event.attribution_details_json = attr.details_json.clone();
 
-                        event_batch.push((session_id, event));
+                        if let Some(ref state) = &self.attribution_state {
+                            let now = OffsetDateTime::now_utc();
+                            state
+                                .record_attribution(
+                                    &attr.session_id,
+                                    matches!(
+                                        event.event_type,
+                                        antidote_core::EventType::FileWrite
+                                            | antidote_core::EventType::FileCreate
+                                            | antidote_core::EventType::FileDelete
+                                            | antidote_core::EventType::FileRename
+                                            | antidote_core::EventType::FileRead
+                                    ),
+                                    matches!(
+                                        event.event_type,
+                                        antidote_core::EventType::NetHttp | antidote_core::EventType::NetConnect
+                                    ),
+                                    now,
+                                )
+                                .await;
+                            if event.attribution_reason.as_deref() == Some("pid") {
+                                if let Some(pid) = event.payload.get("pid").and_then(|v| v.as_i64()).map(|p| p as i32) {
+                                    state.insert_pid_session(pid, attr.session_id.clone(), now).await;
+                                }
+                            }
+                        }
+
+                        event_batch.push((attr.session_id, event));
 
                         // Flush if batch is full or interval elapsed
                         if event_batch.len() >= batch_size || last_flush.elapsed() >= batch_interval {
@@ -122,84 +214,6 @@ impl PipelineWorker {
         }
 
         info!("Pipeline worker stopped");
-    }
-
-    /// Resolve session ID using improved heuristics (Phase 3 + Phase 4 pid-based)
-    async fn resolve_session_id(&self, event: &Event) -> String {
-        // Phase 4: If event has pid, try pid-based attribution first
-        if let Some(_pid) = event.payload.get("pid").and_then(|v| v.as_i64()).map(|v| v as i32) {
-            // TODO: Query process tree index from audit collector if available
-            // For now, fall through to Phase 3 heuristics
-        }
-
-        // For ProcStart, get candidate roots and pass to session manager
-        if event.event_type == EventType::ProcStart {
-            let candidate_roots = self.storage.get_enabled_roots().await.ok();
-            if let Some(id) = self.session_manager.get_or_assign_session(event, candidate_roots).await {
-                // Update foreground session on new process start
-                self.session_manager.update_foreground_from_activity().await;
-                return id;
-            }
-        }
-
-        // For ProcExit, use session manager
-        if event.event_type == EventType::ProcExit {
-            if let Some(id) = self.session_manager.get_or_assign_session(event, None).await {
-                return id;
-            }
-        }
-
-        // For FS events (including FileRead from Phase 4): attribute to session whose roots include the event path
-        if matches!(event.event_type, EventType::FileWrite | EventType::FileCreate | EventType::FileDelete | EventType::FileRename | EventType::FileRead) {
-            if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
-                let matching_sessions = self.session_manager.get_sessions_for_path(path).await;
-                
-                if !matching_sessions.is_empty() {
-                    // Multiple matches: use foreground session as tiebreaker
-                    let fg_session = self.session_manager.get_foreground_session().await;
-                    if let Some(fg) = fg_session {
-                        if matching_sessions.contains(&fg) {
-                            debug!("Attributed FS event to foreground session {}", fg);
-                            return fg;
-                        }
-                    }
-                    // Use first matching session (most recently created)
-                    let session_id = matching_sessions[0].clone();
-                    debug!("Attributed FS event to session {} (path under root)", session_id);
-                    // Track observed root
-                    if let Some(root) = self.find_root_for_path(path).await {
-                        self.session_manager.add_observed_root(&session_id, root.clone()).await;
-                        debug!("Tracked observed root {} for session {}", root, session_id);
-                    }
-                    return session_id;
-                }
-            }
-        }
-
-        // For Net events: attribute to foreground session
-        if matches!(event.event_type, EventType::NetHttp | EventType::NetConnect) {
-            let fg_session = self.session_manager.get_foreground_session().await;
-            if let Some(fg) = fg_session {
-                debug!("Attributed Net event to foreground session {}", fg);
-                return fg;
-            }
-        }
-
-        // Fallback: most recently active session
-        let active_sessions = self.session_manager.get_active_sessions().await;
-        if active_sessions.is_empty() {
-            return "background".to_string();
-        }
-
-        let session_id = active_sessions
-            .iter()
-            .max_by_key(|s| s.last_event_ts)
-            .map(|s| s.session_id.clone())
-            .unwrap_or_else(|| "background".to_string());
-        
-        // Update foreground session based on activity
-        self.session_manager.update_foreground_from_activity().await;
-        session_id
     }
 
     /// Find which watched root a path belongs to (helper)
@@ -266,6 +280,9 @@ impl PipelineWorker {
                         event_type: EventType::Tick,
                         payload: serde_json::json!({}),
                         enforcement_action: false,
+                        attribution_reason: None,
+                        attribution_confidence: None,
+                        attribution_details_json: None,
                     };
                     let flags = self.rule_engine.evaluate_event(&tick_event, state);
                     (flags, state.clone())
@@ -323,12 +340,50 @@ impl PipelineWorker {
             }
         }
 
+        // Step 4: Track observed root for file events (for future path attribution)
+        if session_id != "background"
+            && matches!(
+                event.event_type,
+                EventType::FileWrite | EventType::FileCreate | EventType::FileDelete
+                    | EventType::FileRename | EventType::FileRead
+            )
+        {
+            if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
+                if let Some(root) = self.find_root_for_path(path).await {
+                    self.session_manager.add_observed_root(session_id, root).await;
+                }
+            }
+        }
+
         // Ensure session row exists before inserting events (FK: events.session_id -> sessions.session_id)
         self.update_session_summary(session_id, &state_clone).await;
 
         // Persist event
         if let Err(e) = self.storage.insert_event(&event).await {
             error!("Failed to insert event: {}", e);
+        } else if let Some(ref ti) = &self.telemetry_integrity {
+            let confidence = event.attribution_confidence.unwrap_or(0);
+            let is_file = matches!(
+                event.event_type,
+                EventType::FileWrite
+                    | EventType::FileCreate
+                    | EventType::FileDelete
+                    | EventType::FileRename
+                    | EventType::FileRead
+            );
+            let coalesced = event
+                .payload
+                .get("repeat_count")
+                .and_then(|v| v.as_u64())
+                .map(|n| n > 1)
+                .unwrap_or(false);
+            ti.record_event_stored(
+                confidence,
+                session_id,
+                is_file,
+                session_id == "background",
+                coalesced,
+            );
         }
 
         // Persist flags if any (and record risk history for high/crit for Phase 5 escalation)
@@ -359,11 +414,14 @@ impl PipelineWorker {
             }
         }
 
-        // Clean up ended sessions from in-memory state
+        // Clean up ended sessions from in-memory state and attribution PID cache
         if session_id != "background" {
             if let Some(session) = self.session_manager.get_session(session_id).await {
                 if session.end_ts.is_some() {
                     self.session_states.remove(session_id);
+                    if let Some(ref state) = &self.attribution_state {
+                        state.remove_session_pids(session_id).await;
+                    }
                     debug!("Removed ended session {} from in-memory state", session_id);
                 }
             }
@@ -407,6 +465,7 @@ impl PipelineWorker {
                 baseline_comparison_summary: None,
                 enforcement_actions_count: 0,
                 forced_terminated: false,
+                summary_json: None,
             };
 
             if let Err(e) = self.storage.upsert_session_summary(&summary).await {
@@ -444,6 +503,7 @@ impl PipelineWorker {
             baseline_comparison_summary: session.baseline_comparison_summary.clone(),
             enforcement_actions_count: session.enforcement_actions_count,
             forced_terminated: session.forced_terminated,
+            summary_json: session.summary_json.clone(),
         };
 
         if let Err(e) = self.storage.upsert_session_summary(&summary).await {

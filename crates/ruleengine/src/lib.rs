@@ -259,6 +259,9 @@ mod tests {
                 "argv": ["rm", "-rf", "/"]
             }),
             enforcement_action: false,
+            attribution_reason: None,
+            attribution_confidence: None,
+            attribution_details_json: None,
         };
 
         for _ in 0..3 {
