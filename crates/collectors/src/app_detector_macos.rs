@@ -80,25 +80,11 @@ pub struct AppSignature {
     main_process_only: bool,
 }
 
+/// Session-bearing process signatures only. Cursor/VSCode main process is excluded —
+/// we only track Renderers (one per window). Claude has no Renderer model, so we track its main process.
 pub fn default_signatures() -> Vec<AppSignature> {
     vec![
-        // Main processes: one session per app
-        AppSignature {
-            app: AppKind::Cursor,
-            names: vec!["Cursor"],
-            main_process_only: true,
-        },
-        AppSignature {
-            app: AppKind::VSCode,
-            names: vec!["Code", "Visual Studio Code", "code"],
-            main_process_only: true,
-        },
-        AppSignature {
-            app: AppKind::Claude,
-            names: vec!["Claude"],
-            main_process_only: true,
-        },
-        // Renderer processes: one session per window (exact match only)
+        // Cursor/VSCode: Renderer only (one session per window). Main process excluded — no session.
         AppSignature {
             app: AppKind::Cursor,
             names: vec!["Cursor Helper (Renderer)"],
@@ -107,6 +93,12 @@ pub fn default_signatures() -> Vec<AppSignature> {
         AppSignature {
             app: AppKind::VSCode,
             names: vec!["Code Helper (Renderer)", "Code - Renderer"],
+            main_process_only: true,
+        },
+        // Claude: main process (no multi-window Renderer model)
+        AppSignature {
+            app: AppKind::Claude,
+            names: vec!["Claude"],
             main_process_only: true,
         },
     ]
@@ -259,25 +251,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cursor_exact_match() {
+    fn cursor_main_ignored() {
         let sigs = default_signatures();
-        assert_eq!(match_app("Cursor", &sigs), Some(AppKind::Cursor));
-        assert_eq!(match_app("cursor", &sigs), Some(AppKind::Cursor));
+        // Main process excluded — only Renderer creates sessions
+        assert_eq!(match_app("Cursor", &sigs), None);
+        assert_eq!(match_app("cursor", &sigs), None);
     }
 
     #[test]
     fn cursor_helper_ignored() {
         let sigs = default_signatures();
+        // Generic "Cursor Helper" and Plugin processes should not match (only Renderer does)
         assert_eq!(match_app("Cursor Helper", &sigs), None);
-        assert_eq!(match_app("Cursor Helper (Renderer)", &sigs), None);
+        assert_eq!(match_app("Cursor Helper (Plugin)", &sigs), None);
     }
 
     #[test]
-    fn vscode_match() {
+    fn vscode_main_ignored() {
         let sigs = default_signatures();
-        assert_eq!(match_app("Code", &sigs), Some(AppKind::VSCode));
-        assert_eq!(match_app("code", &sigs), Some(AppKind::VSCode));
-        assert_eq!(match_app("Visual Studio Code", &sigs), Some(AppKind::VSCode));
+        // Main process excluded — only Renderer creates sessions
+        assert_eq!(match_app("Code", &sigs), None);
+        assert_eq!(match_app("code", &sigs), None);
+        assert_eq!(match_app("Visual Studio Code", &sigs), None);
     }
 
     #[test]

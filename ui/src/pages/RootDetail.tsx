@@ -1,41 +1,31 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useUISession } from "../app/hooks";
-import { formatDate, formatBytes, formatDuration } from "../app/format";
+import { useUIRootDetail } from "../app/hooks";
+import { formatDate, formatBytes } from "../app/format";
 import StatusPill from "../components/StatusPill";
 import Card from "../components/Card";
 import Loading from "../components/Loading";
 import ErrorState from "../components/ErrorState";
+import type { TrustStatus } from "../app/types";
 
-export default function SessionDetail() {
+export default function RootDetail() {
   const { id } = useParams<{ id: string }>();
+  const rootId = id ? parseInt(id, 10) : undefined;
   const [eventsExpanded, setEventsExpanded] = useState(false);
-  const { data, error, loading, refresh } = useUISession(id);
+  const { data, error, loading, refresh } = useUIRootDetail(rootId);
 
   if (loading && !data) return <Loading />;
   if (error && !data)
-    return (
-      <ErrorState
-        error={error}
-        onRetry={refresh}
-      />
-    );
-  if (!data || !id)
-    return (
-      <p style={{ color: "var(--text-muted)" }}>Session not found</p>
-    );
+    return <ErrorState error={error} onRetry={refresh} />;
+  if (!data || rootId == null || isNaN(rootId))
+    return <p style={{ color: "var(--text-muted)" }}>Root not found</p>;
 
-  const { session, candidate_roots, observed_roots, top_findings, touched_files, domains, recent_events, diagnostics } = data;
-  const dur = session.duration_seconds ?? 0;
+  const { path, trust, top_findings, touched_files, domains, recent_events } = data;
 
   return (
     <div>
       <p style={{ marginBottom: "1rem" }}>
         <Link to="/" style={{ color: "var(--accent)" }}>← Dashboard</Link>
-        {" · "}
-        <Link to={`/apps/${encodeURIComponent(session.app)}`} style={{ color: "var(--accent)" }}>
-          View all {session.app} sessions
-        </Link>
       </p>
 
       <div
@@ -47,75 +37,11 @@ export default function SessionDetail() {
           flexWrap: "wrap",
         }}
       >
-        <h2 style={{ fontSize: "1.5rem" }}>
-          {session.app} — {formatDate(session.started_at)}
+        <h2 style={{ fontSize: "1.25rem", fontFamily: "monospace", wordBreak: "break-all" }}>
+          {path}
         </h2>
-        <StatusPill status={session.trust} />
-        {dur > 0 && (
-          <span style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>
-            Duration: {formatDuration(dur)}
-          </span>
-        )}
+        <StatusPill status={trust as TrustStatus} />
       </div>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
-          gap: "1rem",
-          marginBottom: "1.5rem",
-        }}
-      >
-        <Card>
-          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Risk</div>
-          <div style={{ fontSize: "1.25rem", fontWeight: 600 }}>{session.risk_score}</div>
-        </Card>
-        <Card>
-          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Drift</div>
-          <div style={{ fontSize: "1.25rem", fontWeight: 600 }}>{session.drift_score}</div>
-        </Card>
-        <Card>
-          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Events</div>
-          <div style={{ fontSize: "1.25rem", fontWeight: 600 }}>{session.event_count}</div>
-        </Card>
-        <Card>
-          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Egress</div>
-          <div style={{ fontSize: "1.25rem", fontWeight: 600 }}>
-            {formatBytes(
-              domains.reduce((s, d) => s + d.egress_bytes, 0)
-            )}
-          </div>
-        </Card>
-      </div>
-
-      {(candidate_roots.length > 0 || observed_roots.length > 0) && (
-        <Card title="Session Roots">
-          {candidate_roots.length > 0 && (
-            <div style={{ marginBottom: observed_roots.length > 0 ? "1rem" : 0 }}>
-              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: "0.25rem" }}>
-                Candidate roots (at session start)
-              </div>
-              <ul style={{ listStyle: "none", fontSize: "0.85rem", fontFamily: "monospace", margin: 0, padding: 0 }}>
-                {candidate_roots.map((r, i) => (
-                  <li key={i} style={{ padding: "0.2rem 0", wordBreak: "break-all" }}>{r}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-          {observed_roots.length > 0 && (
-            <div>
-              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: "0.25rem" }}>
-                Observed roots (paths that saw activity)
-              </div>
-              <ul style={{ listStyle: "none", fontSize: "0.85rem", fontFamily: "monospace", margin: 0, padding: 0 }}>
-                {observed_roots.map((r, i) => (
-                  <li key={i} style={{ padding: "0.2rem 0", wordBreak: "break-all" }}>{r}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </Card>
-      )}
 
       {top_findings.length > 0 && (
         <Card title="Top Findings">
@@ -148,7 +74,7 @@ export default function SessionDetail() {
         {touched_files.length === 0 ? (
           <p style={{ color: "var(--text-muted)" }}>None</p>
         ) : (
-          <ul style={{ listStyle: "none", fontSize: "0.85rem" }}>
+          <ul style={{ listStyle: "none", fontSize: "0.85rem", margin: 0, padding: 0 }}>
             {touched_files.map((f, i) => (
               <li
                 key={i}
@@ -182,7 +108,7 @@ export default function SessionDetail() {
         {domains.length === 0 ? (
           <p style={{ color: "var(--text-muted)" }}>None</p>
         ) : (
-          <ul style={{ listStyle: "none", fontSize: "0.85rem" }}>
+          <ul style={{ listStyle: "none", fontSize: "0.85rem", margin: 0, padding: 0 }}>
             {domains.map((d, i) => (
               <li
                 key={i}
@@ -218,7 +144,7 @@ export default function SessionDetail() {
         }
       >
         {eventsExpanded ? (
-          <ul style={{ listStyle: "none", fontSize: "0.8rem" }}>
+          <ul style={{ listStyle: "none", fontSize: "0.8rem", margin: 0, padding: 0 }}>
             {recent_events.map((e, i) => (
               <li
                 key={i}
@@ -247,25 +173,7 @@ export default function SessionDetail() {
                       {e.details.rel_path ?? e.details.path}
                     </span>
                   )}
-                  {e.details?.bytes != null && (
-                    <span style={{ color: "var(--text-muted)" }}>({e.details.bytes} B)</span>
-                  )}
-                  {e.details?.bytes_in != null && (
-                    <span style={{ color: "var(--text-muted)" }}>in: {e.details.bytes_in} B</span>
-                  )}
-                  {e.details?.bytes_out != null && (
-                    <span style={{ color: "var(--text-muted)" }}>out: {e.details.bytes_out} B</span>
-                  )}
-                  {e.details?.argv && e.details.argv.length > 0 && (
-                    <span style={{ color: "var(--text-muted)" }}>argv: {e.details.argv.join(" ")}</span>
-                  )}
                 </div>
-                {e.attribution_reason && (
-                  <div style={{ fontSize: "0.7rem", color: "var(--text-muted)", marginTop: "0.2rem" }}>
-                    attr={e.attribution_reason}
-                    {e.confidence != null && ` conf=${e.confidence}`}
-                  </div>
-                )}
               </li>
             ))}
           </ul>
@@ -274,14 +182,6 @@ export default function SessionDetail() {
             {recent_events.length} events (expand to view)
           </p>
         )}
-      </Card>
-
-      <Card title="Telemetry">
-        <div style={{ fontSize: "0.9rem" }}>
-          Confidence: {diagnostics.telemetry_confidence} · Attribution quality:{" "}
-          {(diagnostics.attribution_quality * 100).toFixed(0)}% · Root coverage:{" "}
-          {(diagnostics.root_coverage * 100).toFixed(0)}%
-        </div>
       </Card>
     </div>
   );

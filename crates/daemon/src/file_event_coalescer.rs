@@ -216,7 +216,7 @@ mod tests {
             let ev = Event {
                 id: uuid::Uuid::new_v4(),
                 ts: now,
-                session_id: "pending".to_string(),
+                root_id: None,
                 event_type: EventType::FileWrite,
                 payload: serde_json::json!({ "path": path }),
                 enforcement_action: false,

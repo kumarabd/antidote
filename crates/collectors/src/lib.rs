@@ -26,7 +26,7 @@ pub use nsworkspace_observer_macos::{spawn_foreground_activate_observer, spawn_n
 pub use audit_macos::AuditCollector;
 #[cfg(target_os = "macos")]
 pub use workspace_resolver_macos::{
-    spawn_storage_watcher, Confidence, SourceTier, WorkspaceEvent, WorkspaceResolver,
+    spawn_storage_watcher, WorkspaceEvent, WorkspaceResolver,
     WorkspaceResolverConfig, WorkspaceResolverState, WorkspaceState,
 };
 #[cfg(target_os = "macos")]
@@ -117,7 +117,7 @@ impl ProcessPoller {
                         let event = Event {
                             id: Uuid::new_v4(),
                             ts: OffsetDateTime::now_utc(),
-                            session_id: "pending".to_string(),
+                            root_id: None,
                             event_type: EventType::ProcStart,
                             payload,
                             enforcement_action: false,
@@ -163,7 +163,7 @@ impl ProcessPoller {
                     let event = Event {
                         id: uuid::Uuid::new_v4(),
                         ts: OffsetDateTime::now_utc(),
-                        session_id: "pending".to_string(),
+                        root_id: None,
                         event_type: EventType::ProcExit,
                         payload,
                         enforcement_action: false,

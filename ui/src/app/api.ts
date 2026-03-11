@@ -17,14 +17,30 @@ async function fetchJsonOptional<T>(path: string): Promise<T | null> {
 export const api = {
   uiState: (params?: { recent_limit?: number }) => {
     const q = params?.recent_limit ? `?recent_limit=${params.recent_limit}` : "";
-    return fetchJson<import("./types").UIStateResponse>(`/ui/state${q}`);
+    return fetchJson<import("./types").UIStateResponse>(`/api/ui/state${q}`);
   },
   uiSession: (id: string, params?: { events_limit?: number }) => {
     const q = params?.events_limit
       ? `?events_limit=${params.events_limit}`
       : "";
     return fetchJson<import("./types").UISessionResponse>(
-      `/ui/sessions/${encodeURIComponent(id)}${q}`
+      `/api/ui/sessions/${encodeURIComponent(id)}${q}`
+    );
+  },
+  uiRootDetail: (id: number, params?: { events_limit?: number }) => {
+    const q = params?.events_limit
+      ? `?events_limit=${params.events_limit}`
+      : "";
+    return fetchJson<import("./types").UIRootDetailResponse>(
+      `/api/ui/roots/${id}${q}`
+    );
+  },
+  uiAppDetail: (app: string, params?: { events_limit?: number }) => {
+    const q = params?.events_limit
+      ? `?events_limit=${params.events_limit}`
+      : "";
+    return fetchJson<import("./types").UIAppDetailResponse>(
+      `/api/ui/apps/${encodeURIComponent(app)}${q}`
     );
   },
   debugZeroConfigStatus: () =>

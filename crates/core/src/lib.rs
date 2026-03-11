@@ -73,7 +73,9 @@ pub struct Event {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
     pub ts: OffsetDateTime,
-    pub session_id: String,
+    /// Root this event is associated with (watcher is per-root)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<i64>,
     pub event_type: EventType,
     pub payload: serde_json::Value,
     /// Phase 6: True if this event represents an enforcement action (block, freeze, etc.)
@@ -92,15 +94,11 @@ pub struct Event {
 
 impl Event {
     /// Create a new event
-    pub fn new(
-        session_id: String,
-        event_type: EventType,
-        payload: serde_json::Value,
-    ) -> Self {
+    pub fn new(event_type: EventType, payload: serde_json::Value) -> Self {
         Self {
             id: Uuid::new_v4(),
             ts: OffsetDateTime::now_utc(),
-            session_id,
+            root_id: None,
             event_type,
             payload,
             enforcement_action: false,
@@ -885,7 +883,7 @@ mod attribution_tests {
         Event {
             id: uuid::Uuid::new_v4(),
             ts: OffsetDateTime::now_utc(),
-            session_id: "pending".to_string(),
+            root_id: None,
             event_type: ty,
             payload,
             enforcement_action: false,
@@ -965,7 +963,7 @@ mod attribution_tests {
         let event = Event {
             id: uuid::Uuid::new_v4(),
             ts: OffsetDateTime::now_utc(),
-            session_id: "pending".to_string(),
+            root_id: None,
             event_type: EventType::NetHttp,
             payload: serde_json::json!({ "domain": "example.com" }),
             enforcement_action: false,

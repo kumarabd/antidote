@@ -7,6 +7,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      "/api": { target: "http://127.0.0.1:17845", changeOrigin: true },
       "/ui": { target: "http://127.0.0.1:17845", changeOrigin: true },
       "/support": { target: "http://127.0.0.1:17845", changeOrigin: true },
       "/debug": { target: "http://127.0.0.1:17845", changeOrigin: true },

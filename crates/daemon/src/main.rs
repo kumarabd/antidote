@@ -122,27 +122,15 @@ impl Default for AppDetectorConfig {
 struct WorkspaceResolverConfigDaemon {
     enabled: bool,
     poll_interval_ms: u64,
-    max_roots_per_app: usize,
-    dev_dir_candidates: Vec<String>,
-    lsof_fallback_enabled: bool,
-    lsof_min_interval_ms: u64,
+    max_roots_per_session: usize,
 }
 
 impl Default for WorkspaceResolverConfigDaemon {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_ms: 30_000, // 30s fallback; FSEvents on storage dirs provides event-driven wake
-            max_roots_per_app: 5,
-            dev_dir_candidates: vec![
-                "~/code".to_string(),
-                "~/dev".to_string(),
-                "~/projects".to_string(),
-                "~/workspace".to_string(),
-                "~/Documents".to_string(),
-            ],
-            lsof_fallback_enabled: true,
-            lsof_min_interval_ms: 30000,
+            poll_interval_ms: 10_000,
+            max_roots_per_session: 10,
         }
     }
 }
@@ -416,7 +404,7 @@ async fn process_finalized_session(
     let _ = storage.upsert_session_summary(&summary).await;
 }
 
-/// Phase 6: Run emergency freeze - kill active session processes and mark sessions forced_terminated
+/// Phase 6: Run emergency freeze - mark sessions forced_terminated (observation only; never kills processes)
 async fn run_emergency_freeze(
     storage: &Storage,
     session_manager: &SessionManager,
@@ -424,30 +412,6 @@ async fn run_emergency_freeze(
     let active = session_manager.get_active_sessions().await;
     let now = time::OffsetDateTime::now_utc();
     let session_ids: Vec<String> = active.iter().map(|s| s.session_id.clone()).collect();
-    let pids: Vec<i32> = active.iter().map(|s| s.root_pid).filter(|&p| p != 0).collect();
-
-    for pid in pids {
-        #[cfg(unix)]
-        {
-            use std::process::Stdio;
-            match tokio::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-                }
-                Err(e) => {
-                    warn!("Failed to kill pid {}: {}", pid, e);
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = pid;
-    }
 
     session_manager.force_end_sessions(&session_ids).await;
 
@@ -593,11 +557,22 @@ async fn main() -> Result<()> {
     );
     info!("Rules engine loaded");
 
-    // Create session manager
-    let session_manager = Arc::new(SessionManager::new(
+    // Create session manager. On macOS with app detector, ProcessPoller must not create sessions
+    // for Cursor/VSCode/Claude — SessionLifecycleManager (AppEvent) is the sole creator.
+    let mut session_manager = SessionManager::new(
         config.watch_processes.clone(),
         config.idle_timeout_minutes,
-    ));
+    );
+    #[cfg(target_os = "macos")]
+    if config.app_detector.enabled {
+        session_manager = session_manager.with_skip_proc_start_creation(vec![
+            "Cursor Helper (Renderer)".to_string(),
+            "Code Helper (Renderer)".to_string(),
+            "Code - Renderer".to_string(),
+            "Claude".to_string(),
+        ]);
+    }
+    let session_manager = Arc::new(session_manager);
     info!("Session manager initialized");
 
     // Create event channels: raw -> coalescer (ignore + coalesce) -> pipeline
@@ -625,6 +600,14 @@ async fn main() -> Result<()> {
             0,
         );
         let _ = storage.upsert_session_summary(&enforcement_session).await;
+    }
+
+    // Clean up auto roots whose session is no longer active. User roots are never touched.
+    {
+        let disabled = storage.disable_auto_roots_with_dead_sessions().await.unwrap_or(0);
+        if disabled > 0 {
+            info!("Startup: disabled {} auto roots (sessions no longer active)", disabled);
+        }
     }
 
     // Initialize FS watcher manager (sends to raw_tx; coalescer filters and forwards to pipeline)
@@ -695,13 +678,21 @@ async fn main() -> Result<()> {
                     consumer_lifecycle.handle_app_event(ev.clone()).await;
                     match ev {
                         AppEvent::Started { app, pid, process_name: _, bundle_id, started_at } => {
-                            info!("App started: {} pid={}", app.as_display_str(), pid);
+                            let app_str = app.as_display_str().to_string();
+                            let is_first_instance = !by_pid.values().any(|i| i.app.as_display_str() == app_str);
+                            if is_first_instance {
+                                info!("App started: {}", app.as_display_str());
+                            }
                             let instance = antidote_collectors::AppInstance::new(app, pid, bundle_id, started_at);
                             by_pid.insert(pid, instance);
                         }
                         AppEvent::Exited { app, pid, exited_at: _ } => {
-                            info!("App exited: {} pid={}", app.as_display_str(), pid);
                             by_pid.remove(&pid);
+                            let app_str = app.as_display_str().to_string();
+                            let is_last_instance = !by_pid.values().any(|i| i.app.as_display_str() == app_str);
+                            if is_last_instance {
+                                info!("App exited: {}", app.as_display_str());
+                            }
                         }
                         AppEvent::ScanComplete { at } => {
                             let instances: Vec<_> = by_pid.values().cloned().collect();
@@ -729,10 +720,10 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let app_detector_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Workspace resolver (macOS only): infers workspace roots; event-driven via storage FSEvents
+    // Workspace resolver (macOS only): discovers roots per session via lsof
     #[cfg(target_os = "macos")]
     let (workspace_resolver_state, workspace_resolver_handle, workspace_event_rx) = {
-        if !config.workspace_resolver.enabled || app_detector_state.is_none() {
+        if !config.workspace_resolver.enabled {
             (None, None, None)
         } else {
             let state = Arc::new(RwLock::new(WorkspaceResolverState::default()));
@@ -743,16 +734,13 @@ async fn main() -> Result<()> {
                 antidote_collectors::spawn_storage_watcher(wake_tx, shutdown_rx_watcher);
             let resolver_config = WorkspaceResolverConfig {
                 poll_interval_ms: config.workspace_resolver.poll_interval_ms,
-                max_roots_per_app: config.workspace_resolver.max_roots_per_app,
-                dev_dir_candidates: config.workspace_resolver.dev_dir_candidates.clone(),
-                lsof_fallback_enabled: config.workspace_resolver.lsof_fallback_enabled,
-                lsof_min_interval_ms: config.workspace_resolver.lsof_min_interval_ms,
+                max_roots_per_source: config.workspace_resolver.max_roots_per_session,
+                wake_debounce_secs: 3,
             };
             let resolver = WorkspaceResolver::new(resolver_config, state.clone(), Some(event_tx));
-            let app_state = app_detector_state.clone().unwrap();
             let shutdown_rx_ws = shutdown_tx.subscribe();
             let handle = tokio::spawn(async move {
-                resolver.run(app_state, shutdown_rx_ws, wake_rx).await;
+                resolver.run(shutdown_rx_ws, wake_rx).await;
             });
             (Some(state), Some(handle), Some(event_rx))
         }
@@ -926,7 +914,7 @@ async fn main() -> Result<()> {
                     let event = Event {
                         id: uuid::Uuid::new_v4(),
                         ts: time::OffsetDateTime::now_utc(),
-                        session_id: "broadcast".to_string(),
+                        root_id: None,
                         event_type: EventType::Tick,
                         payload: serde_json::json!({}),
                         enforcement_action: false,
@@ -997,15 +985,20 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Phase 6: Spawn freeze task (kill active sessions when freeze is triggered)
+    // Phase 6: Spawn freeze task (mark sessions frozen when freeze is triggered; never kills processes)
     let freeze_storage = storage.clone();
     let freeze_session_manager = session_manager.clone();
     let mut shutdown_rx_freeze = shutdown_tx.subscribe();
     let freeze_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = freeze_rx.recv() => {
-                    run_emergency_freeze(&freeze_storage, &freeze_session_manager).await;
+                msg = freeze_rx.recv() => {
+                    // Only run on explicit freeze message; ignore channel close (shutdown)
+                    if msg.is_some() {
+                        run_emergency_freeze(&freeze_storage, &freeze_session_manager).await;
+                    } else {
+                        break;
+                    }
                 }
                 _ = shutdown_rx_freeze.recv() => break,
             }

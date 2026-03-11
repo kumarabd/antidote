@@ -44,31 +44,6 @@ pub struct PipelineWorker {
 }
 
 impl PipelineWorker {
-    /// Phase 6: Send SIGTERM to process (never panics)
-    async fn kill_pid_sigterm(pid: i32) {
-        #[cfg(unix)]
-        {
-            use std::process::Stdio;
-            if let Ok(mut child) = tokio::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    child.wait(),
-                )
-                .await;
-            } else {
-                warn!("Failed to spawn kill for pid {}", pid);
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = pid;
-    }
-
     pub fn new(
         storage: Arc<Storage>,
         rule_engine: Arc<RuleEngine>,
@@ -158,7 +133,6 @@ impl PipelineWorker {
                         )
                         .await;
                         let attr = attribution_engine::attribute(&event, &ctx);
-                        event.session_id = attr.session_id.clone();
                         event.attribution_reason = Some(attr.reason);
                         event.attribution_confidence = Some(attr.confidence);
                         event.attribution_details_json = attr.details_json.clone();
@@ -242,7 +216,7 @@ impl PipelineWorker {
     }
 
     /// Process a single event
-    async fn process_event(&mut self, session_id: &str, event: Event) {
+    async fn process_event(&mut self, session_id: &str, mut event: Event) {
         // Update session last_event_ts (skip for background session)
         if session_id != "background" {
             if !self.session_manager.update_session(session_id, &event).await {
@@ -276,7 +250,7 @@ impl PipelineWorker {
                     let tick_event = Event {
                         id: uuid::Uuid::new_v4(),
                         ts: time::OffsetDateTime::now_utc(),
-                        session_id: active_id.clone(),
+                        root_id: None,
                         event_type: EventType::Tick,
                         payload: serde_json::json!({}),
                         enforcement_action: false,
@@ -355,8 +329,25 @@ impl PipelineWorker {
             }
         }
 
-        // Ensure session row exists before inserting events (FK: events.session_id -> sessions.session_id)
+        // Update session summary for attribution/counts (sessions are independent; events are not associated)
         self.update_session_summary(session_id, &state_clone).await;
+
+        // Set root_id for file events (primary association: watcher is per-root)
+        if event.root_id.is_none()
+            && matches!(
+                event.event_type,
+                EventType::FileWrite | EventType::FileCreate | EventType::FileDelete
+                    | EventType::FileRename | EventType::FileRead
+            )
+        {
+            if let Some(path) = event.payload.get("path").and_then(|v| v.as_str()) {
+                if let Some(root_path) = self.find_root_for_path(path).await {
+                    if let Ok(Some(wr)) = self.storage.get_watched_root_by_path(&root_path).await {
+                        event.root_id = Some(wr.id);
+                    }
+                }
+            }
+        }
 
         // Persist event
         if let Err(e) = self.storage.insert_event(&event).await {
@@ -391,15 +382,14 @@ impl PipelineWorker {
             self.persist_flags(session_id, &app, &flags).await;
         }
 
-        // Phase 6: Dangerous command blocking (when enforcement enabled and audit provided PID)
+        // Phase 6: Dangerous command detection (observation only; never kills processes)
         if event.event_type == EventType::CmdExec
             && flags.iter().any(|f| f.rule_id == "R3")
         {
             let enf = self.enforcement.read().await;
             if enf.enabled && enf.block_dangerous_commands {
-                if let Some(pid) = event.payload.get("pid").and_then(|v| v.as_i64()).map(|p| p as i32) {
+                if let Some(pid) = event.payload.get("pid").and_then(|v| v.as_i64()) {
                     drop(enf);
-                    Self::kill_pid_sigterm(pid).await;
                     let block_flag = Flag::new(
                         session_id.to_string(),
                         "BLOCKED_COMMAND".to_string(),
@@ -407,7 +397,7 @@ impl PipelineWorker {
                         20,
                         Label::EnforcementBlocked,
                         event.payload.clone(),
-                        format!("Blocked dangerous command (pid {})", pid),
+                        format!("Detected dangerous command (pid {})", pid),
                     );
                     self.persist_flags(session_id, &app, &[block_flag]).await;
                 }

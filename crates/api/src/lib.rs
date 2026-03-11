@@ -222,8 +222,10 @@ fn create_router_routes(state: ApiState) -> Router {
         .route("/debug/retention", get(debug_retention_handler))
         .route("/support/diagnostics/export", post(diagnostics_export::diagnostics_export_handler))
         .route("/capabilities", get(capabilities_handler))
-        .route("/ui/state", get(ui_state_handler))
-        .route("/ui/sessions/:id", get(ui_session_handler))
+        .route("/api/ui/state", get(ui_state_handler))
+        .route("/api/ui/roots/:id", get(ui_root_detail_handler))
+        .route("/api/ui/sessions/:id", get(ui_session_handler))
+        .route("/api/ui/apps/:app", get(ui_app_detail_handler))
         .route("/ui", get(ui_redirect_handler))
         .route("/ui/", get(ui_index_handler))
         .route("/ui/insights", get(ui_insights_handler))
@@ -284,8 +286,10 @@ fn create_router_routes(state: ApiState) -> Router {
         .route("/debug/attribution/simulate", get(debug_attribution_simulate_handler))
         .route("/debug/attribution/state", get(debug_attribution_state_handler))
         .route("/capabilities", get(capabilities_handler))
-        .route("/ui/state", get(ui_state_handler))
-        .route("/ui/sessions/:id", get(ui_session_handler))
+        .route("/api/ui/state", get(ui_state_handler))
+        .route("/api/ui/roots/:id", get(ui_root_detail_handler))
+        .route("/api/ui/sessions/:id", get(ui_session_handler))
+        .route("/api/ui/apps/:app", get(ui_app_detail_handler))
         .route("/ui", get(ui_redirect_handler))
         .route("/ui/", get(ui_index_handler))
         .route("/ui/insights", get(ui_insights_handler))
@@ -370,7 +374,7 @@ async fn debug_attribution_simulate_handler(
         Event {
             id: uuid::Uuid::new_v4(),
             ts: time::OffsetDateTime::now_utc(),
-            session_id: "pending".to_string(),
+            root_id: None,
             event_type: EventType::FileWrite,
             payload: serde_json::json!({ "path": path }),
             enforcement_action: false,
@@ -382,7 +386,7 @@ async fn debug_attribution_simulate_handler(
         Event {
             id: uuid::Uuid::new_v4(),
             ts: time::OffsetDateTime::now_utc(),
-            session_id: "pending".to_string(),
+            root_id: None,
             event_type: EventType::NetHttp,
             payload: serde_json::json!({ "domain": domain }),
             enforcement_action: false,
@@ -743,12 +747,57 @@ struct UIGlobalState {
 }
 
 #[derive(Serialize)]
+struct UIAppSummary {
+    name: String,
+    active_count: u32,
+    recent_count: u32,
+}
+
+#[derive(Serialize)]
 struct UIStateResponse {
     version: String,
     now: String,
     global: UIGlobalState,
+    apps: Vec<UIAppSummary>,
     active_sessions: Vec<UISessionRow>,
     recent_sessions: Vec<UISessionRow>,
+    /// Cursor windows from workspace resolver (source_id, roots per window).
+    cursor_windows: Vec<UICursorWindow>,
+    /// Roots with trust (path, trust, id for linking).
+    roots_with_trust: Vec<UIRootWithTrustAndId>,
+}
+
+#[derive(Serialize)]
+struct UICursorWindow {
+    source_id: String,
+    app: String,
+    roots: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UIRootWithTrustAndId {
+    id: i64,
+    path: String,
+    trust: String,
+}
+
+#[derive(Serialize)]
+struct UIRootDetailResponse {
+    id: i64,
+    path: String,
+    trust: String,
+    top_findings: Vec<UITopFinding>,
+    touched_files: Vec<UITouchedFile>,
+    domains: Vec<UIDomainContact>,
+    recent_events: Vec<UIRecentEvent>,
+}
+
+#[derive(Serialize)]
+struct UIAppDetailResponse {
+    app: String,
+    active_sessions: Vec<UISessionRow>,
+    recent_sessions: Vec<UISessionRow>,
+    roots_with_trust: Vec<UIRootWithTrustAndId>,
 }
 
 #[derive(Serialize)]
@@ -930,7 +979,81 @@ async fn ui_state_handler(
         recent_rows.push(session_row_from_summary(s, &flags));
     }
 
-    let _ = wr; // roots available for future use
+    // App-centric summary: group sessions by app
+    let mut app_counts: HashMap<String, (u32, u32)> = HashMap::new();
+    for s in &active_rows {
+        let entry = app_counts.entry(s.app.clone()).or_insert((0, 0));
+        entry.0 += 1;
+    }
+    for s in &recent_rows {
+        let entry = app_counts.entry(s.app.clone()).or_insert((0, 0));
+        entry.1 += 1;
+    }
+    let apps: Vec<UIAppSummary> = app_counts
+        .into_iter()
+        .map(|(name, (active_count, recent_count))| UIAppSummary {
+            name,
+            active_count,
+            recent_count,
+        })
+        .collect();
+
+    // Cursor windows from workspace resolver (macOS)
+    let cursor_windows: Vec<UICursorWindow> = {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(ref g) = state.workspace_resolver_state {
+                let s = g.read().await;
+                s.items
+                    .iter()
+                    .filter(|i| format!("{:?}", i.app).to_lowercase().contains("cursor"))
+                    .map(|i| UICursorWindow {
+                        source_id: i.source_id.clone(),
+                        app: format!("{:?}", i.app),
+                        roots: i.roots.clone(),
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        vec![]
+    };
+
+    // Derive trust per root from sessions that observed that root
+    let mut root_to_trust: HashMap<String, String> = HashMap::new();
+    let worse = |a: &str, b: &str| {
+        if a == "Risky" || b == "Risky" {
+            "Risky"
+        } else if a == "NeedsReview" || b == "NeedsReview" {
+            "NeedsReview"
+        } else {
+            "Trusted"
+        }
+    };
+    for s in active_sessions.iter().chain(recent.iter()) {
+        let flags = state.storage.list_flags(&s.session_id, Some(5), None).await.unwrap_or_default();
+        let trust = trust_from_risk_and_warnings(s.risk.score, flags.iter().any(|f| matches!(f.severity, antidote_core::Severity::High | antidote_core::Severity::Crit)), flags.iter().any(|f| f.severity == antidote_core::Severity::Med));
+        for r in &s.observed_roots {
+            let existing = root_to_trust.get(r).map(|s| s.as_str());
+            root_to_trust.insert(r.clone(), worse(existing.unwrap_or("Trusted"), &trust).to_string());
+        }
+    }
+
+    let roots_with_trust: Vec<UIRootWithTrustAndId> = wr
+        .into_iter()
+        .filter(|r| r.enabled)
+        .map(|r| {
+            let trust = root_to_trust.get(&r.path).cloned().unwrap_or_else(|| "Trusted".to_string());
+            UIRootWithTrustAndId {
+                id: r.id,
+                path: r.path,
+                trust,
+            }
+        })
+        .collect();
+
     Ok(Json(UIStateResponse {
         version: "0.1.0".to_string(),
         now: now.to_string(),
@@ -941,8 +1064,160 @@ async fn ui_state_handler(
             reasons,
             warnings,
         },
+        apps,
         active_sessions: active_rows,
         recent_sessions: recent_rows,
+        cursor_windows,
+        roots_with_trust,
+    }))
+}
+
+#[derive(Deserialize)]
+struct UIRootParams {
+    events_limit: Option<u32>,
+}
+
+async fn ui_root_detail_handler(
+    State(state): State<ApiState>,
+    Path(root_id): Path<i64>,
+    Query(params): Query<UIRootParams>,
+) -> Result<Json<UIRootDetailResponse>, StatusCode> {
+    let events_limit = params.events_limit.unwrap_or(50).min(100);
+
+    let roots = state.storage.list_watched_roots().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let root = roots.into_iter().find(|r| r.id == root_id).ok_or(StatusCode::NOT_FOUND)?;
+    let root_path = root.path.clone();
+
+    let all_sessions = state.storage.list_sessions(Some(200), None, None, None).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut all_events: Vec<(time::OffsetDateTime, Event)> = Vec::new();
+    let mut path_counts: HashMap<(String, String), u32> = HashMap::new();
+    let mut domain_counts: HashMap<String, (u32, u64)> = HashMap::new();
+    let mut findings: HashMap<String, (String, Vec<String>, u32)> = HashMap::new();
+    let mut root_to_trust: HashMap<String, String> = HashMap::new();
+
+    // Events: primary association is root (watcher is per-root)
+    let root_events = state.storage.list_events_by_root(root_id, Some(events_limit), None).await.unwrap_or_default();
+    for e in &root_events {
+        all_events.push((e.ts, e.clone()));
+        if let Some(path) = e.payload.get("path").and_then(|v| v.as_str()) {
+            let (op, _) = match e.event_type {
+                EventType::FileRead => ("read".to_string(), ()),
+                EventType::FileWrite | EventType::FileCreate | EventType::FileRename => ("write".to_string(), ()),
+                EventType::FileDelete => ("delete".to_string(), ()),
+                _ => continue,
+            };
+            *path_counts.entry((path.to_string(), op)).or_insert(0) += 1;
+        }
+    }
+
+    let session_touches_root = |s: &antidote_core::SessionSummary| {
+        s.observed_roots.iter().any(|r| r == &root_path || r.starts_with(&root_path) || root_path.starts_with(r))
+    };
+
+    // Domains, findings, trust: from sessions that touch this root
+    for s in all_sessions.iter().filter(|s| session_touches_root(s)) {
+        let events = state.storage.list_events(&s.session_id, Some(events_limit), None).await.unwrap_or_default();
+        let flags = state.storage.list_flags(&s.session_id, Some(50), None).await.unwrap_or_default();
+        let trust = trust_from_risk_and_warnings(s.risk.score, flags.iter().any(|f| matches!(f.severity, antidote_core::Severity::High | antidote_core::Severity::Crit)), flags.iter().any(|f| f.severity == antidote_core::Severity::Med));
+        for r in &s.observed_roots {
+            let existing = root_to_trust.get(r).map(|x| x.as_str());
+            let worse = |a: &str, b: &str| if a == "Risky" || b == "Risky" { "Risky" } else if a == "NeedsReview" || b == "NeedsReview" { "NeedsReview" } else { "Trusted" };
+            root_to_trust.insert(r.clone(), worse(existing.unwrap_or("Trusted"), &trust).to_string());
+        }
+        for e in &events {
+            if matches!(e.event_type, EventType::NetHttp | EventType::NetConnect) {
+                if let Some(d) = e.payload.get("domain").and_then(|v| v.as_str()) {
+                    let bytes = e.payload.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ent = domain_counts.entry(d.to_string()).or_insert((0, 0));
+                    ent.0 += 1;
+                    ent.1 += bytes;
+                }
+            }
+        }
+        for f in &flags {
+            let sev = match f.severity { antidote_core::Severity::Crit | antidote_core::Severity::High => "high", antidote_core::Severity::Med => "medium", _ => "low" };
+            let label = format!("{:?}", f.label);
+            let entry = findings.entry(label.clone()).or_insert((sev.to_string(), Vec::new(), 0));
+            entry.2 += 1;
+            if entry.1.len() < 3 { entry.1.push(f.message.clone()); }
+        }
+    }
+
+    all_events.sort_by(|a, b| b.0.cmp(&a.0));
+    all_events.truncate(events_limit as usize);
+
+    let touched_files: Vec<UITouchedFile> = path_counts
+        .into_iter()
+        .map(|((path, op), count)| UITouchedFile { path, op, count })
+        .collect::<Vec<_>>();
+    let mut touched_sorted = touched_files;
+    touched_sorted.sort_by(|a, b| b.count.cmp(&a.count));
+    touched_sorted.truncate(20);
+
+    let domains: Vec<UIDomainContact> = domain_counts
+        .into_iter()
+        .map(|(domain, (count, egress_bytes))| UIDomainContact { domain, count, egress_bytes })
+        .collect::<Vec<_>>();
+    let mut domains_sorted = domains;
+    domains_sorted.sort_by(|a, b| b.count.cmp(&a.count));
+    domains_sorted.truncate(20);
+
+    let top_findings: Vec<UITopFinding> = findings
+        .into_iter()
+        .map(|(label, (severity, examples, count))| UITopFinding { label, severity, count, examples })
+        .collect();
+
+    let recent_events: Vec<UIRecentEvent> = all_events
+        .into_iter()
+        .map(|(_, e)| {
+            let kind = match e.event_type {
+                EventType::FileRead | EventType::FileWrite | EventType::FileCreate | EventType::FileDelete | EventType::FileRename => "fs",
+                EventType::NetHttp | EventType::NetConnect => "net",
+                EventType::CmdExec | EventType::ProcSpawn => "cmd",
+                _ => "sys",
+            };
+            let (summary, details) = match e.event_type {
+                EventType::FileWrite | EventType::FileCreate | EventType::FileDelete | EventType::FileRename | EventType::FileRead => {
+                    let path = e.payload.get("path").and_then(|v| v.as_str()).map(String::from);
+                    let rel_path = e.payload.get("rel_path").and_then(|v| v.as_str()).map(String::from);
+                    let bytes = e.payload.get("bytes").and_then(|v| v.as_u64());
+                    let op = match e.event_type { EventType::FileWrite => "write", EventType::FileCreate => "create", EventType::FileDelete => "delete", EventType::FileRename => "rename", EventType::FileRead => "read", _ => "fs" };
+                    let path_display = path.as_deref().unwrap_or("?");
+                    let summary = format!("{} {} {}", op, path_display, bytes.map(|b| format!("({} B)", b)).unwrap_or_default()).trim_end().to_string();
+                    (summary, Some(UIRecentEventDetails { path, rel_path, domain: None, bytes, bytes_in: None, bytes_out: None, argv: None, name: None, pid: None }))
+                }
+                EventType::NetHttp | EventType::NetConnect => {
+                    let domain = e.payload.get("domain").and_then(|v| v.as_str()).map(String::from);
+                    let bytes_in = e.payload.get("bytes_in").and_then(|v| v.as_u64());
+                    let bytes_out = e.payload.get("bytes").or(e.payload.get("bytes_out")).and_then(|v| v.as_u64());
+                    let summary = domain.as_deref().map(|d| format!("{} {}B", d, bytes_out.or(bytes_in).unwrap_or(0))).unwrap_or_else(|| format!("{:?}", e.event_type));
+                    (summary, Some(UIRecentEventDetails { path: None, rel_path: None, domain, bytes: bytes_out.or(bytes_in), bytes_in, bytes_out, argv: None, name: None, pid: None }))
+                }
+                _ => (format!("{:?}", e.event_type), None),
+            };
+            UIRecentEvent {
+                ts: e.ts.to_string(),
+                event_type: format!("{:?}", e.event_type),
+                kind: kind.to_string(),
+                summary,
+                details,
+                attribution_reason: e.attribution_reason.clone(),
+                confidence: e.attribution_confidence.map(|c| format!("{}", c)),
+            }
+        })
+        .collect();
+
+    let trust = root_to_trust.get(&root_path).cloned().unwrap_or_else(|| "Trusted".to_string());
+
+    Ok(Json(UIRootDetailResponse {
+        id: root.id,
+        path: root_path,
+        trust,
+        top_findings,
+        touched_files: touched_sorted,
+        domains: domains_sorted,
+        recent_events,
     }))
 }
 
@@ -1257,6 +1532,121 @@ async fn ui_session_handler(
     }))
 }
 
+async fn ui_app_detail_handler(
+    State(state): State<ApiState>,
+    Path(app_name): Path<String>,
+) -> Result<Json<UIAppDetailResponse>, StatusCode> {
+    let all_sessions = state
+        .storage
+        .list_sessions(Some(200), None, None, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let app_sessions: Vec<_> = all_sessions
+        .iter()
+        .filter(|s| s.app.eq_ignore_ascii_case(&app_name))
+        .cloned()
+        .collect();
+
+    if app_sessions.is_empty() {
+        return Ok(Json(UIAppDetailResponse {
+            app: app_name.clone(),
+            active_sessions: vec![],
+            recent_sessions: vec![],
+            roots_with_trust: vec![],
+        }));
+    }
+
+    let (active, recent): (Vec<_>, Vec<_>) = app_sessions
+        .into_iter()
+        .partition(|s| s.end_ts.is_none());
+
+    let mut active_rows = Vec::new();
+    let mut recent_rows = Vec::new();
+    let mut root_to_trust: HashMap<String, String> = HashMap::new();
+
+    for s in &active {
+        let flags = state.storage.list_flags(&s.session_id, Some(50), None).await.unwrap_or_default();
+        active_rows.push(session_row_from_summary(s, &flags));
+        let trust = session_row_from_summary(s, &flags).trust;
+        for r in &s.observed_roots {
+            let existing = root_to_trust.get(r).map(|s| s.as_str());
+            let worse = |a: &str, b: &str| {
+                if a == "Risky" || b == "Risky" {
+                    "Risky"
+                } else if a == "NeedsReview" || b == "NeedsReview" {
+                    "NeedsReview"
+                } else {
+                    "Trusted"
+                }
+            };
+            let new_trust = worse(existing.unwrap_or("Trusted"), &trust);
+            root_to_trust.insert(r.clone(), new_trust.to_string());
+        }
+    }
+
+    for s in &recent {
+        let flags = state.storage.list_flags(&s.session_id, Some(50), None).await.unwrap_or_default();
+        recent_rows.push(session_row_from_summary(s, &flags));
+        let trust = session_row_from_summary(s, &flags).trust;
+        for r in s.observed_roots.iter() {
+            let existing = root_to_trust.get(r).map(|s| s.as_str());
+            let worse = |a: &str, b: &str| {
+                if a == "Risky" || b == "Risky" {
+                    "Risky"
+                } else if a == "NeedsReview" || b == "NeedsReview" {
+                    "NeedsReview"
+                } else {
+                    "Trusted"
+                }
+            };
+            let new_trust = worse(existing.unwrap_or("Trusted"), &trust);
+            root_to_trust.insert(r.clone(), new_trust.to_string());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(ref guard) = state.workspace_resolver_state {
+            let ws = guard.read().await;
+            let app_lower = app_name.to_lowercase();
+            for item in ws.items.iter().filter(|i| i.app.as_display_str().to_lowercase() == app_lower) {
+                for r in &item.roots {
+                    if !root_to_trust.contains_key(r) {
+                        root_to_trust.insert(r.clone(), "Trusted".to_string());
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app_name;
+
+    let watched = state.storage.list_watched_roots().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let path_to_id: std::collections::HashMap<String, i64> = watched
+        .into_iter()
+        .map(|w| (w.path, w.id))
+        .collect();
+
+    let roots_with_trust: Vec<UIRootWithTrustAndId> = root_to_trust
+        .into_iter()
+        .filter_map(|(path, trust)| {
+            path_to_id.get(&path).map(|&id| UIRootWithTrustAndId {
+                id,
+                path,
+                trust,
+            })
+        })
+        .collect();
+
+    Ok(Json(UIAppDetailResponse {
+        app: app_name,
+        active_sessions: active_rows,
+        recent_sessions: recent_rows,
+        roots_with_trust,
+    }))
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Serialize)]
 struct DebugAppsResponse {
@@ -1318,12 +1708,9 @@ struct DebugWorkspacesResponse {
 #[cfg(target_os = "macos")]
 #[derive(Serialize)]
 struct DebugWorkspaceItemDto {
+    source_id: String,
     app: antidote_collectors::AppKind,
-    pid: i32,
     roots: Vec<String>,
-    confidence: antidote_collectors::Confidence,
-    #[serde(rename = "source_tier")]
-    source: antidote_collectors::SourceTier,
     observed_at: String,
 }
 
@@ -1343,11 +1730,9 @@ async fn debug_workspaces_handler(
         .items
         .iter()
         .map(|i| DebugWorkspaceItemDto {
+            source_id: i.source_id.clone(),
             app: i.app.clone(),
-            pid: i.pid,
             roots: i.roots.clone(),
-            confidence: i.confidence,
-            source: i.source,
             observed_at: i
                 .observed_at
                 .format(&time::format_description::well_known::Rfc3339)
@@ -1384,11 +1769,9 @@ async fn debug_workspaces_by_app_handler(
         .iter()
         .filter(|i| i.app.as_display_str().to_lowercase() == app_lower)
         .map(|i| DebugWorkspaceItemDto {
+            source_id: i.source_id.clone(),
             app: i.app.clone(),
-            pid: i.pid,
             roots: i.roots.clone(),
-            confidence: i.confidence,
-            source: i.source,
             observed_at: i
                 .observed_at
                 .format(&time::format_description::well_known::Rfc3339)
@@ -1484,11 +1867,9 @@ async fn debug_zero_config_status_handler(
                 .items
                 .iter()
                 .map(|i| DebugWorkspaceItemDto {
+                    source_id: i.source_id.clone(),
                     app: i.app.clone(),
-                    pid: i.pid,
                     roots: i.roots.clone(),
-                    confidence: i.confidence,
-                    source: i.source,
                     observed_at: i
                         .observed_at
                         .format(&time::format_description::well_known::Rfc3339)
@@ -1521,13 +1902,13 @@ async fn debug_zero_config_status_handler(
         None => vec![],
     };
     let fs_active = !watchers.is_empty();
-    let ws_high = workspaces
+    let ws_has_roots = workspaces
         .items
         .iter()
-        .any(|i| format!("{:?}", i.confidence) == "High");
+        .any(|i| !i.roots.is_empty());
     let (global_confidence, _reasons): (String, Vec<String>) = if !fs_active {
         ("Low".to_string(), vec![])
-    } else if !ws_high && !workspaces.items.is_empty() {
+    } else if !ws_has_roots && !workspaces.items.is_empty() {
         ("Medium".to_string(), vec![])
     } else if !state.proxy_enabled {
         ("Medium".to_string(), vec![])
@@ -1869,11 +2250,7 @@ async fn emit_event_handler(
 
     if let Some(ref tx) = state.pipeline_tx {
         // Send through pipeline: attribution, rules, persist. Use "pending" so attribution runs.
-        let mut event = Event::new("pending".to_string(), event_type, req.payload);
-        // Preserve session_id for ProcStart/ProcExit if caller specified one
-        if matches!(event_type, EventType::ProcStart | EventType::ProcExit) && req.session_id != "pending" {
-            event.session_id = req.session_id;
-        }
+        let event = Event::new(event_type, req.payload);
         if tx.send(event).is_err() {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
@@ -1881,7 +2258,7 @@ async fn emit_event_handler(
     }
 
     // Fallback: direct insert (no attribution, no rules) when API runs without daemon pipeline
-    let event = Event::new(req.session_id, event_type, req.payload);
+    let event = Event::new(event_type, req.payload);
     state
         .storage
         .insert_event(&event)

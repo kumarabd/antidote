@@ -46,6 +46,28 @@ export function useUISession(id: string | undefined, eventsLimit = 50) {
   );
 }
 
+export function useUIRootDetail(id: number | undefined, eventsLimit = 50) {
+  return usePoll(
+    () =>
+      id != null
+        ? api.uiRootDetail(id, { events_limit: eventsLimit })
+        : Promise.reject(new Error("No root id")),
+    2000,
+    [id, eventsLimit]
+  );
+}
+
+export function useUIAppDetail(app: string | undefined, eventsLimit = 50) {
+  return usePoll(
+    () =>
+      app && app.trim()
+        ? api.uiAppDetail(app, { events_limit: eventsLimit })
+        : Promise.reject(new Error("No app name")),
+    2000,
+    [app, eventsLimit]
+  );
+}
+
 export function useDiagnostics() {
   const [zeroConfig, setZeroConfig] = useState<unknown | null>(null);
   const [health, setHealth] = useState<unknown | null>(null);

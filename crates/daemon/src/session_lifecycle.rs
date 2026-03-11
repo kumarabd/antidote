@@ -56,17 +56,8 @@ impl SessionLifecycleManager {
     }
 
     #[cfg(target_os = "macos")]
-    async fn handle_started(&self, app: AppKind, pid: i32, process_name: Option<&str>) {
-        // Cursor/VSCode: only create sessions for renderer processes (one per window), not main process
-        if matches!(app, AppKind::Cursor | AppKind::VSCode) {
-            let name_lower = process_name.unwrap_or("").to_lowercase();
-            let is_main = name_lower == "cursor"
-                || name_lower == "code"
-                || name_lower == "visual studio code";
-            if is_main {
-                return;
-            }
-        }
+    async fn handle_started(&self, app: AppKind, pid: i32, _process_name: Option<&str>) {
+        // App detector only emits for session-bearing processes (Renderers for Cursor/VSCode, main for Claude)
         let app_str = app.as_display_str().to_string();
 
         if self.session_manager.get_session_for_pid(pid).await.is_some() {
@@ -265,40 +256,6 @@ mod tests {
 
             let active2 = session_manager.get_active_sessions().await;
             assert_eq!(active2.len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_cursor_main_process_no_session() {
-        let storage = Arc::new(
-            Storage::init(&temp_db_url())
-                .await
-                .expect("init"),
-        );
-        let session_manager = Arc::new(SessionManager::new(
-            vec!["Cursor".to_string()],
-            20,
-        ));
-        let lifecycle = SessionLifecycleManager::new(
-            session_manager.clone(),
-            storage.clone(),
-            20,
-        );
-
-        #[cfg(target_os = "macos")]
-        {
-            lifecycle
-                .handle_app_event(antidote_collectors::AppEvent::Started {
-                    app: antidote_collectors::AppKind::Cursor,
-                    pid: 11111,
-                    process_name: Some("Cursor".to_string()),
-                    bundle_id: None,
-                    started_at: time::OffsetDateTime::now_utc(),
-                })
-                .await;
-
-            let active = session_manager.get_active_sessions().await;
-            assert_eq!(active.len(), 0, "main Cursor process should not create a session");
         }
     }
 

@@ -269,7 +269,6 @@ impl AuditCollector {
 
                     // Emit CmdExec event
                     let event = Event::new(
-                        "pending".to_string(),
                         EventType::CmdExec,
                         serde_json::json!({
                             "pid": pid_val,
@@ -307,7 +306,6 @@ impl AuditCollector {
                         };
 
                         let event = Event::new(
-                            session_id.unwrap_or_else(|| "pending".to_string()),
                             event_type,
                             serde_json::json!({
                                 "pid": pid_val,
@@ -343,7 +341,6 @@ impl AuditCollector {
                         };
 
                         let event = Event::new(
-                            session_id.unwrap_or_else(|| "pending".to_string()),
                             EventType::NetConnect,
                             serde_json::json!({
                                 "pid": pid_val,

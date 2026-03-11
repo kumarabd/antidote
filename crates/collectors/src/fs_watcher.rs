@@ -256,7 +256,7 @@ fn handle_fs_event(
                 let ev = Event {
                     id: Uuid::new_v4(),
                     ts: OffsetDateTime::now_utc(),
-                    session_id: "pending".to_string(),
+                    root_id: None,
                     event_type,
                     payload,
                     enforcement_action: false,

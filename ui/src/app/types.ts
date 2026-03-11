@@ -28,12 +28,55 @@ export interface GlobalState {
   warnings: Warning[];
 }
 
+export interface AppSummary {
+  name: string;
+  active_count: number;
+  recent_count: number;
+}
+
+export interface RootWithTrust {
+  path: string;
+  trust: string;
+}
+
+export interface CursorWindow {
+  source_id: string;
+  app: string;
+  roots: string[];
+}
+
+export interface RootWithTrustAndId {
+  id: number;
+  path: string;
+  trust: string;
+}
+
 export interface UIStateResponse {
   version: string;
   now: string;
   global: GlobalState;
+  apps: AppSummary[];
   active_sessions: SessionSummaryRow[];
   recent_sessions: SessionSummaryRow[];
+  cursor_windows: CursorWindow[];
+  roots_with_trust: RootWithTrustAndId[];
+}
+
+export interface UIRootDetailResponse {
+  id: number;
+  path: string;
+  trust: string;
+  top_findings: TopFinding[];
+  touched_files: TouchedFile[];
+  domains: DomainContact[];
+  recent_events: RecentEvent[];
+}
+
+export interface UIAppDetailResponse {
+  app: string;
+  active_sessions: SessionSummaryRow[];
+  recent_sessions: SessionSummaryRow[];
+  roots_with_trust: RootWithTrustAndId[];
 }
 
 export interface TopFinding {

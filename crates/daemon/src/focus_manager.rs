@@ -114,12 +114,14 @@ impl FocusManager {
         let app_kind = app_kind_from_name(&fg.name);
         let app_str = app_kind.as_ref().map(|k| k.as_display_str().to_string());
 
-        let workspace_roots = if let (Some(ref ws), Some(pid)) = (&self.workspace_state, fg.pid) {
+        let session_id = self.resolve_session_id(app_kind.clone(), fg.pid).await;
+
+        // Workspace roots are decoupled from sessions; use all roots from resolver (Cursor windows)
+        let workspace_roots = if let Some(ref ws) = &self.workspace_state {
             let state = ws.read().await;
             state
                 .items
                 .iter()
-                .filter(|i| app_kind.as_ref() == Some(&i.app) && i.pid == pid)
                 .flat_map(|i| i.roots.clone())
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
@@ -127,8 +129,6 @@ impl FocusManager {
         } else {
             Vec::new()
         };
-
-        let session_id = self.resolve_session_id(app_kind.clone(), fg.pid).await;
         let confidence = self.compute_confidence(
             app_kind.is_some(),
             session_id.is_some(),

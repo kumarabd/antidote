@@ -253,7 +253,7 @@ mod tests {
         let event = Event {
             id: Uuid::new_v4(),
             ts: OffsetDateTime::now_utc(),
-            session_id: "test".to_string(),
+            root_id: None,
             event_type: EventType::CmdExec,
             payload: serde_json::json!({
                 "argv": ["rm", "-rf", "/"]

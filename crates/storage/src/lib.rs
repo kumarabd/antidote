@@ -106,6 +106,9 @@ impl Storage {
             include_str!("../migrations/0010_sessions_lifecycle.sql"),
             include_str!("../migrations/0011_coalesced_events.sql"),
             include_str!("../migrations/0012_attribution_details.sql"),
+            include_str!("../migrations/0013_autoroot_session_ref.sql"),
+            include_str!("../migrations/0014_events_root_id.sql"),
+            include_str!("../migrations/0015_events_drop_session.sql"),
         ];
 
         for (i, migration_sql) in migrations.iter().enumerate() {
@@ -312,12 +315,12 @@ impl Storage {
             .and_then(|v| serde_json::to_string(v).ok());
         sqlx::query(
             r#"
-            INSERT INTO events (id, session_id, ts, event_type, payload_json, pid, ppid, enforcement_action, attribution_reason, attribution_confidence, attributed_at, repeat_count, coalesced_duration_ms, attribution_details_json)
+            INSERT INTO events (id, root_id, ts, event_type, payload_json, pid, ppid, enforcement_action, attribution_reason, attribution_confidence, attributed_at, repeat_count, coalesced_duration_ms, attribution_details_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(event.id.to_string())
-        .bind(&event.session_id)
+        .bind(event.root_id)
         .bind(event.ts.to_string())
         .bind(event_type)
         .bind(&payload_json)
@@ -680,10 +683,53 @@ impl Storage {
         }
     }
 
-    /// List events for a session
+    /// List events for a session (via roots the session observed)
     pub async fn list_events(
         &self,
         session_id: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<Event>> {
+        let session = match self.get_session(session_id).await? {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        let roots = self.list_watched_roots().await?;
+        let root_ids: Vec<i64> = roots
+            .iter()
+            .filter(|r| {
+                session.observed_roots.iter().any(|o| {
+                    *o == r.path || o.starts_with(r.path.as_str()) || r.path.starts_with(o.as_str())
+                })
+            })
+            .map(|r| r.id)
+            .collect();
+
+        if root_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Query events for any of these roots, merge and sort
+        let mut all_events = Vec::new();
+        let per_root = (limit.unwrap_or(100) as usize).max(1);
+        for rid in &root_ids {
+            let evs = self
+                .list_events_by_root(*rid, Some(per_root as u32), None)
+                .await?;
+            all_events.extend(evs);
+        }
+        all_events.sort_by(|a, b| b.ts.cmp(&a.ts));
+        all_events.dedup_by(|a, b| a.id == b.id);
+        let offset = offset.unwrap_or(0) as usize;
+        let limit = limit.unwrap_or(100) as usize;
+        let events: Vec<Event> = all_events.into_iter().skip(offset).take(limit).collect();
+        Ok(events)
+    }
+
+    /// List events for a root (primary association: watcher is per-root)
+    pub async fn list_events_by_root(
+        &self,
+        root_id: i64,
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Event>> {
@@ -692,24 +738,24 @@ impl Storage {
 
         let rows = sqlx::query(
             r#"
-            SELECT id, session_id, ts, event_type, payload_json, enforcement_action, attribution_reason, attribution_confidence, attribution_details_json
+            SELECT id, root_id, ts, event_type, payload_json, enforcement_action, attribution_reason, attribution_confidence, attribution_details_json
             FROM events
-            WHERE session_id = ?
+            WHERE root_id = ?
             ORDER BY ts DESC
             LIMIT ? OFFSET ?
             "#,
         )
-        .bind(session_id)
+        .bind(root_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .context("Failed to list events")?;
+        .context("Failed to list events by root")?;
 
         let mut events = Vec::new();
         for row in rows {
             let id_str: String = row.get("id");
-            let session_id_str: String = row.get("session_id");
+            let row_root_id: Option<i64> = row.try_get("root_id").ok();
             let ts_str: String = row.get("ts");
             let event_type_str: String = row.get("event_type");
             let payload_json: String = row.get("payload_json");
@@ -750,7 +796,7 @@ impl Storage {
             events.push(Event {
                 id,
                 ts,
-                session_id: session_id_str,
+                root_id: row_root_id,
                 event_type,
                 payload,
                 enforcement_action: enforcement_action != 0,
@@ -882,7 +928,7 @@ impl Storage {
     pub async fn list_watched_roots(&self) -> Result<Vec<WatchedRoot>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, path, source, pinned, enabled, last_seen_ts, added_ts, updated_ts
+            SELECT id, path, source, pinned, enabled, session_ref, last_seen_ts, added_ts, updated_ts
             FROM watched_roots
             ORDER BY added_ts DESC
             "#
@@ -903,6 +949,7 @@ impl Storage {
             };
             let pinned: i64 = row.try_get("pinned").unwrap_or(0);
             let enabled: i64 = row.get("enabled");
+            let session_ref: Option<String> = row.try_get("session_ref").ok();
             let last_seen_ts: Option<String> = row.try_get("last_seen_ts").ok();
             let added_ts: String = row.get("added_ts");
             let updated_ts: Option<String> = row.try_get("updated_ts").ok();
@@ -921,6 +968,7 @@ impl Storage {
                 source,
                 pinned: pinned != 0,
                 enabled: enabled != 0,
+                session_ref,
                 last_seen_ts,
                 added_ts,
                 updated_ts,
@@ -974,7 +1022,7 @@ impl Storage {
     pub async fn get_watched_root_by_path(&self, path: &str) -> Result<Option<WatchedRoot>> {
         let row = sqlx::query(
             r#"
-            SELECT id, path, source, pinned, enabled, last_seen_ts, added_ts, updated_ts
+            SELECT id, path, source, pinned, enabled, session_ref, last_seen_ts, added_ts, updated_ts
             FROM watched_roots
             WHERE path = ?
             "#
@@ -997,6 +1045,7 @@ impl Storage {
         };
         let pinned: i64 = row.get("pinned");
         let enabled: i64 = row.get("enabled");
+        let session_ref: Option<String> = row.try_get("session_ref").ok();
         let last_seen_ts: Option<String> = row.try_get("last_seen_ts").ok();
         let added_ts: String = row.get("added_ts");
         let updated_ts: Option<String> = row.try_get("updated_ts").ok();
@@ -1012,15 +1061,16 @@ impl Storage {
             source,
             pinned: pinned != 0,
             enabled: enabled != 0,
+            session_ref,
             last_seen_ts,
             added_ts,
             updated_ts,
         }))
     }
 
-    /// Upsert an auto root: insert if new, or update last_seen_ts (and optionally enabled) if exists.
-    /// Does not change source from 'user' to 'auto'. Does not enable a user-disabled root.
-    pub async fn upsert_auto_root(&self, path: &str) -> Result<()> {
+    /// Upsert an auto root: insert if new, or update last_seen_ts and session_ref (and optionally enabled) if exists.
+    /// session_ref: session_id linking the root to the session. Does not change source from 'user' to 'auto'.
+    pub async fn upsert_auto_root(&self, path: &str, session_ref: Option<&str>) -> Result<()> {
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|e| anyhow::anyhow!("format timestamp: {}", e))?
@@ -1032,10 +1082,11 @@ impl Storage {
                     return Ok(());
                 }
                 sqlx::query(
-                    "UPDATE watched_roots SET last_seen_ts = ?, updated_ts = ?, enabled = 1 WHERE path = ? AND source = 'auto'",
+                    "UPDATE watched_roots SET last_seen_ts = ?, updated_ts = ?, enabled = 1, session_ref = ? WHERE path = ? AND source = 'auto'",
                 )
                 .bind(&now)
                 .bind(&now)
+                .bind(session_ref)
                 .bind(path)
                 .execute(&self.pool)
                 .await
@@ -1044,12 +1095,13 @@ impl Storage {
             None => {
                 sqlx::query(
                     r#"
-                    INSERT INTO watched_roots (path, enabled, added_ts, source, pinned, last_seen_ts, updated_ts)
-                    VALUES (?, 1, ?, 'auto', 0, ?, ?)
+                    INSERT INTO watched_roots (path, enabled, added_ts, source, pinned, session_ref, last_seen_ts, updated_ts)
+                    VALUES (?, 1, ?, 'auto', 0, ?, ?, ?)
                     "#,
                 )
                 .bind(path)
                 .bind(&now)
+                .bind(session_ref)
                 .bind(&now)
                 .bind(&now)
                 .execute(&self.pool)
@@ -1060,7 +1112,53 @@ impl Storage {
         Ok(())
     }
 
+    /// Disable auto roots whose session is no longer active (session not found or end_ts set).
+    /// session_ref stores session_id. Only touches auto roots with session_ref.
+    /// Returns count of disabled roots. Never touches user roots.
+    pub async fn disable_auto_roots_with_dead_sessions(&self) -> Result<u64> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, session_ref FROM watched_roots
+            WHERE source = 'auto' AND pinned = 0 AND enabled = 1 AND session_ref IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list auto roots with session_ref")?;
+
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|e| anyhow::anyhow!("format timestamp: {}", e))?
+            .to_string();
+
+        let mut disabled = 0u64;
+        for row in rows {
+            let id: i64 = row.get("id");
+            let session_ref: String = row.try_get("session_ref").unwrap_or_default();
+            if session_ref.is_empty() {
+                continue;
+            }
+            // Source refs (e.g. cursor:ws:xxx) are not session IDs; skip (cleaned by RootsRemoved).
+            if session_ref.starts_with("cursor:") {
+                continue;
+            }
+            let session = self.get_session(&session_ref).await.ok().flatten();
+            let is_active = session.as_ref().map(|s| s.end_ts.is_none()).unwrap_or(false);
+            if !is_active {
+                sqlx::query("UPDATE watched_roots SET enabled = 0, updated_ts = ? WHERE id = ?")
+                    .bind(&now)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to disable auto root with dead session")?;
+                disabled += 1;
+            }
+        }
+        Ok(disabled)
+    }
+
     /// Disable stale auto roots not seen for longer than the given cutoff (and not pinned).
+    /// Kept for cap enforcement fallback; primary cleanup is disable_auto_roots_with_dead_sessions.
     pub async fn disable_stale_auto_roots(&self, cutoff_ts: &str) -> Result<u64> {
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -1325,6 +1423,9 @@ pub struct WatchedRoot {
     pub source: RootSource,
     pub pinned: bool,
     pub enabled: bool,
+    /// For auto roots: "app:pid" (e.g. "cursor:12345") linking to the session. Null for user roots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_ts: Option<OffsetDateTime>,
     pub added_ts: OffsetDateTime,

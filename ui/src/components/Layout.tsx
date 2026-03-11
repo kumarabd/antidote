@@ -21,11 +21,11 @@ export default function Layout({ children }: { children: ReactNode }) {
           <Link to="/" style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>
             Dashboard
           </Link>
-          <Link
-            to="/diagnostics"
-            style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}
-          >
+          <Link to="/diagnostics" style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>
             Diagnostics
+          </Link>
+          <Link to="/privacy" style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>
+            Privacy
           </Link>
         </nav>
       </header>

@@ -14,7 +14,11 @@ const styles: Record<string, React.CSSProperties> = {
   Unhealthy: { background: "var(--danger)", color: "#fff" },
 };
 
+const FALLBACK_STYLE = { background: "var(--surface-hover)", color: "var(--text)" };
+
 export default function StatusPill({ status }: { status: Status }) {
+  const s = status != null ? String(status) : "";
+  const style = s && styles[s] ? styles[s] : FALLBACK_STYLE;
   return (
     <span
       style={{
@@ -23,10 +27,10 @@ export default function StatusPill({ status }: { status: Status }) {
         borderRadius: 12,
         fontSize: "0.75rem",
         fontWeight: 600,
-        ...styles[status],
+        ...style,
       }}
     >
-      {status}
+      {s || "—"}
     </span>
   );
 }

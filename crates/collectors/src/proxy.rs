@@ -231,7 +231,7 @@ impl ProxyServer {
         let event = Event {
             id: Uuid::new_v4(),
             ts: OffsetDateTime::now_utc(),
-            session_id: "pending".to_string(),
+            root_id: None,
             event_type: EventType::NetHttp,
             payload,
             enforcement_action: false,

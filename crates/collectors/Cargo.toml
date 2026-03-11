@@ -13,6 +13,7 @@ notify = { workspace = true }
 
 # Phase 2: NSWorkspace notifications (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
+antidote-session = { path = "../session" }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSOperation", "block2", "NSString", "NSDictionary", "NSNotification", "NSArray", "NSObject"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSWorkspace", "NSRunningApplication", "libc"] }

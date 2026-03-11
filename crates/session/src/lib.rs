@@ -76,6 +76,8 @@ pub struct SessionManager {
     foreground_session: Arc<RwLock<Option<String>>>,
     /// Last time foreground session was updated
     foreground_updated: Arc<RwLock<Option<time::OffsetDateTime>>>,
+    /// Process names for which we skip ProcStart session creation (e.g. on macOS, app detector owns these)
+    skip_proc_start_creation_for: Vec<String>,
 }
 
 impl SessionManager {
@@ -88,7 +90,15 @@ impl SessionManager {
             idle_timeout_minutes,
             foreground_session: Arc::new(RwLock::new(None)),
             foreground_updated: Arc::new(RwLock::new(None)),
+            skip_proc_start_creation_for: Vec::new(),
         }
+    }
+
+    /// On macOS with app detector: skip ProcStart session creation for these process names.
+    /// SessionLifecycleManager creates them from AppEvent instead. Prevents duplicate sessions.
+    pub fn with_skip_proc_start_creation(mut self, process_names: Vec<String>) -> Self {
+        self.skip_proc_start_creation_for = process_names;
+        self
     }
 
     /// Set the foreground session (manual focus)
@@ -156,13 +166,24 @@ impl SessionManager {
             return None;
         }
 
-        // Check if we already have a session for this pid
+        // Check if we already have a session for this pid (e.g. from SessionLifecycleManager)
         let pid_to_session = self.pid_to_session.read().await;
         if let Some(session_id) = pid_to_session.get(&pid) {
             debug!("Session already exists for pid={}, session_id={}", pid, session_id);
             return Some(session_id.clone());
         }
         drop(pid_to_session);
+
+        // Skip creation for processes owned by app detector (macOS) — SessionLifecycleManager creates them
+        let name_lower = name.to_lowercase();
+        if self
+            .skip_proc_start_creation_for
+            .iter()
+            .any(|n| name_lower == n.to_lowercase())
+        {
+            debug!("Skipping ProcStart session creation for {} (app detector owns)", name);
+            return None;
+        }
 
         // Create new session
         let app = self.infer_app(&name);
@@ -217,18 +238,6 @@ impl SessionManager {
 
     /// Get or assign session for an event
     pub async fn get_or_assign_session(&self, event: &Event, candidate_roots: Option<Vec<String>>) -> Option<String> {
-        // If event already has a session_id (not "pending"), use it
-        if event.session_id != "pending" {
-            // Verify session exists and is active
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(&event.session_id) {
-                if session.is_active() {
-                    return Some(event.session_id.clone());
-                }
-            }
-            return None;
-        }
-
         // For ProcStart/ProcExit, handle specially
         match event.event_type {
             EventType::ProcStart => return self.handle_proc_start(event, candidate_roots).await,
